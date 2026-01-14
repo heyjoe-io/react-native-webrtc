@@ -409,9 +409,18 @@ didFinishRecordingToOutputFileAtURL:(NSURL *)outputFileURL
     AVCaptureDeviceFormat *bestFormat = nil;
     int32_t bestPixelCount = 0;
 
+    // Cap at 4K resolution (3840x2160) to keep file sizes reasonable
+    // 4K = 8,294,400 pixels, but we use slightly higher to allow for minor variations
+    const int32_t maxPixelCount = 3840 * 2160;
+
     for (AVCaptureDeviceFormat *format in device.formats) {
         CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
         int32_t pixelCount = dims.width * dims.height;
+
+        // Skip formats larger than 4K
+        if (pixelCount > maxPixelCount) {
+            continue;
+        }
 
         // Check if format supports target frame rate
         BOOL supportsTargetFps = NO;
@@ -444,7 +453,7 @@ didFinishRecordingToOutputFileAtURL:(NSURL *)outputFileURL
 
     if (bestFormat) {
         CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(bestFormat.formatDescription);
-        NSLog(@"[HeyJoeCapturer] Best format for device: %dx%d", dims.width, dims.height);
+        NSLog(@"[HeyJoeCapturer] Best format for device (capped at 4K): %dx%d", dims.width, dims.height);
     }
 
     return bestFormat;
