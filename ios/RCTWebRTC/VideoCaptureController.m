@@ -1,12 +1,14 @@
 #if !TARGET_OS_TV
 
 #import "VideoCaptureController.h"
+#import "HeyJoeVideoCapturer.h"
 
 #import <React/RCTLog.h>
 
 @interface VideoCaptureController ()
 
-@property(nonatomic, strong) RTCCameraVideoCapturer *capturer;
+@property(nonatomic, strong) RTCCameraVideoCapturer *capturer; // Keep for compatibility, but we use heyJoeCapturer
+@property(nonatomic, strong) HeyJoeVideoCapturer *heyJoeCapturer;
 @property(nonatomic, strong) AVCaptureDeviceFormat *selectedFormat;
 @property(nonatomic, strong) AVCaptureDevice *device;
 @property(nonatomic, copy) NSString *deviceId;
@@ -34,6 +36,10 @@
         self.height = [constraints[@"height"] intValue];
         self.frameRate = [constraints[@"frameRate"] intValue];
 
+        if (self.frameRate == 0) {
+            self.frameRate = 30;
+        }
+
         id facingMode = constraints[@"facingMode"];
 
         if (facingMode && [facingMode isKindOfClass:[NSString class]]) {
@@ -50,6 +56,12 @@
 
             self.usingFrontCamera = position == AVCaptureDevicePositionFront;
         }
+
+        // Create our HeyJoeVideoCapturer using the same delegate as the original capturer
+        // The delegate is the RTCVideoSource that feeds into WebRTC
+        self.heyJoeCapturer = [[HeyJoeVideoCapturer alloc] initWithDelegate:capturer.delegate];
+
+        RCTLog(@"[VideoCaptureController] Initialized with HeyJoeVideoCapturer for unified capture");
     }
 
     return self;
@@ -71,39 +83,45 @@
 
     if (!self.device) {
         RCTLogWarn(@"[VideoCaptureController] No capture devices found!");
-
         return;
     }
 
-    AVCaptureDeviceFormat *format = [self selectFormatForDevice:self.device
-                                                withTargetWidth:self.width
-                                               withTargetHeight:self.height];
+    // Get the BEST format (4K if available) instead of matching constraints
+    AVCaptureDeviceFormat *format = [HeyJoeVideoCapturer bestFormatForDevice:self.device
+                                                             targetFrameRate:self.frameRate];
+    if (!format) {
+        // Fallback to constraint-based selection
+        format = [self selectFormatForDevice:self.device
+                             withTargetWidth:self.width
+                            withTargetHeight:self.height];
+    }
+
     if (!format) {
         RCTLogWarn(@"[VideoCaptureController] No valid formats for device %@", self.device);
-
         return;
     }
 
     self.selectedFormat = format;
 
-    RCTLog(@"[VideoCaptureController] Capture will start");
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+    RCTLog(@"[VideoCaptureController] Starting capture at %dx%d (native resolution)", dims.width, dims.height);
 
-    // Starting the capture happens on another thread. Wait for it.
+    // Start HeyJoeVideoCapturer instead of RTCCameraVideoCapturer
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
 
     __weak VideoCaptureController *weakSelf = self;
-    [self.capturer startCaptureWithDevice:self.device
-                                   format:format
-                                      fps:self.frameRate
-                        completionHandler:^(NSError *err) {
-                            if (err) {
-                                RCTLogError(@"[VideoCaptureController] Error starting capture: %@", err);
-                            } else {
-                                RCTLog(@"[VideoCaptureController] Capture started");
-                                weakSelf.running = YES;
-                            }
-                            dispatch_semaphore_signal(semaphore);
-                        }];
+    [self.heyJoeCapturer startCaptureWithDevice:self.device
+                                         format:format
+                                            fps:self.frameRate
+                              completionHandler:^(NSError *err) {
+                                  if (err) {
+                                      RCTLogError(@"[VideoCaptureController] Error starting capture: %@", err);
+                                  } else {
+                                      RCTLog(@"[VideoCaptureController] Capture started with HeyJoeVideoCapturer");
+                                      weakSelf.running = YES;
+                                  }
+                                  dispatch_semaphore_signal(semaphore);
+                              }];
 
     dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
 }
@@ -113,11 +131,10 @@
         return;
 
     RCTLog(@"[VideoCaptureController] Capture will stop");
-    // Stopping the capture happens on another thread. Wait for it.
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
 
     __weak VideoCaptureController *weakSelf = self;
-    [self.capturer stopCaptureWithCompletionHandler:^{
+    [self.heyJoeCapturer stopCaptureWithCompletionHandler:^{
         RCTLog(@"[VideoCaptureController] Capture stopped");
         weakSelf.running = NO;
         weakSelf.device = nil;
@@ -133,7 +150,11 @@
     self.deviceId = nil;
     self.device = nil;
 
-    [self startCapture];
+    // Stop and restart with new camera
+    [self.heyJoeCapturer stopCaptureWithCompletionHandler:^{
+        self.running = NO;
+        [self startCapture];
+    }];
 }
 
 #pragma mark NSKeyValueObserving
@@ -170,7 +191,11 @@
 
 - (void)removeObserverForDevice:(AVCaptureDevice *)device {
     if (@available(iOS 11.1, *)) {
-        [device removeObserver:self forKeyPath:@"systemPressureState"];
+        @try {
+            [device removeObserver:self forKeyPath:@"systemPressureState"];
+        } @catch (NSException *exception) {
+            // Observer was not registered
+        }
     }
 }
 
