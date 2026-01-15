@@ -80,7 +80,29 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)dealloc {
-    [self stopCaptureWithCompletionHandler:nil];
+    // Synchronous cleanup to ensure all resources are released before dealloc completes
+    // Must dispatch_sync to sessionQueue to ensure proper ordering
+    if (self.sessionQueue) {
+        dispatch_sync(self.sessionQueue, ^{
+            if (self.isRecording) {
+                // Quick cleanup without waiting for finalization
+                self.isRecording = NO;
+                if (self.compressionSession) {
+                    VTCompressionSessionInvalidate(self.compressionSession);
+                    CFRelease(self.compressionSession);
+                    self.compressionSession = NULL;
+                }
+                // Cancel asset writer - file may be incomplete but we're deallocating
+                if (self.assetWriter) {
+                    [self.assetWriter cancelWriting];
+                }
+            }
+            if (self.captureSession && self.captureSession.isRunning) {
+                [self.captureSession stopRunning];
+            }
+        });
+    }
+
     if (_sharedInstance == self) {
         _sharedInstance = nil;
     }
@@ -239,9 +261,40 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             return;
         }
 
-        // Stop recording first if active
+        // Stop recording first if active - must properly finalize to avoid corrupted files
         if (self.isRecording) {
-            [self cleanupRecordingResources];
+            // Flush pending frames
+            if (self.compressionSession) {
+                VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
+            }
+            self.isRecording = NO;
+
+            // Clean up compression session
+            if (self.compressionSession) {
+                VTCompressionSessionInvalidate(self.compressionSession);
+                CFRelease(self.compressionSession);
+                self.compressionSession = NULL;
+            }
+
+            // Properly finalize asset writer to ensure file is playable
+            if (self.assetWriter && self.assetWriter.status == AVAssetWriterStatusWriting) {
+                [self.videoWriterInput markAsFinished];
+                [self.audioWriterInput markAsFinished];
+                // Use synchronous finalization since we're stopping capture
+                dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+                [self.assetWriter finishWritingWithCompletionHandler:^{
+                    dispatch_semaphore_signal(semaphore);
+                }];
+                dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+                NSLog(@"[HeyJoeCapturer] Recording finalized during capture stop");
+            }
+
+            self.assetWriter = nil;
+            self.videoWriterInput = nil;
+            self.audioWriterInput = nil;
+            self.recordingURL = nil;
+            self.hasWrittenFirstVideoFrame = NO;
+            self.recordingStartTime = kCMTimeInvalid;
         }
 
         [self.captureSession stopRunning];
@@ -266,6 +319,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 #pragma mark - Recording Control
 
 - (BOOL)setupCompressionSessionWithWidth:(int)width height:(int)height {
+    // HEVC encoding requires iOS 11.0+
+    if (@available(iOS 11.0, *)) {
+        // iOS 11+ - use HEVC
+    } else {
+        NSLog(@"[HeyJoeCapturer] HEVC encoding requires iOS 11.0 or later");
+        return NO;
+    }
+
     OSStatus status = VTCompressionSessionCreate(
         kCFAllocatorDefault,
         width,
@@ -509,14 +570,21 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             return;
         }
 
-        self.isRecording = NO;
         NSURL *outputURL = self.recordingURL;
 
         NSLog(@"[HeyJoeCapturer] Stopping recording...");
 
-        // Flush compression session - complete all pending frames
+        // Flush compression session FIRST - complete all pending frames while still recording
+        // This ensures all frames are delivered to handleCompressedFrame before we stop
         if (self.compressionSession) {
             VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
+        }
+
+        // NOW set isRecording to NO - no more frames will be accepted
+        self.isRecording = NO;
+
+        // Clean up compression session
+        if (self.compressionSession) {
             VTCompressionSessionInvalidate(self.compressionSession);
             CFRelease(self.compressionSession);
             self.compressionSession = NULL;
