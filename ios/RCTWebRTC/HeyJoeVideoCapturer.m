@@ -2,6 +2,7 @@
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrameBuffer.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <UIKit/UIKit.h>
 
 static HeyJoeVideoCapturer *_sharedInstance = nil;
 
@@ -36,6 +37,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 @property (nonatomic, assign) BOOL isRecording;
 @property (nonatomic, assign) BOOL isCapturing;
+@property (nonatomic, assign) BOOL needsWriterSetup;
 @property (nonatomic, assign) int videoWidth;
 @property (nonatomic, assign) int videoHeight;
 
@@ -66,6 +68,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _writerQueue = dispatch_queue_create("com.heyjoe.capturer.writer", DISPATCH_QUEUE_SERIAL);
         _isRecording = NO;
         _isCapturing = NO;
+        _needsWriterSetup = NO;
         _videoWidth = 1280;
         _videoHeight = 720;
         _hasWrittenFirstVideoFrame = NO;
@@ -107,6 +110,68 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _sharedInstance = nil;
     }
     NSLog(@"[HeyJoeCapturer] Deallocated");
+}
+
+#pragma mark - Orientation Handling
+
+- (UIDeviceOrientation)currentDeviceOrientation {
+    // Get device orientation - must be called on main thread
+    __block UIDeviceOrientation deviceOrientation;
+    if ([NSThread isMainThread]) {
+        deviceOrientation = [UIDevice currentDevice].orientation;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            deviceOrientation = [UIDevice currentDevice].orientation;
+        });
+    }
+    return deviceOrientation;
+}
+
+- (RTCVideoRotation)rtcVideoRotationForCurrentDeviceOrientation {
+    UIDeviceOrientation deviceOrientation = [self currentDeviceOrientation];
+
+    // Convert device orientation to RTCVideoRotation
+    // Note: AVCaptureConnection.videoOrientation is set to Portrait, so pixel buffer
+    // is already in portrait orientation. RTCVideoRotation tells WebRTC how to
+    // display the frame based on current device orientation.
+    switch (deviceOrientation) {
+        case UIDeviceOrientationPortrait:
+            return RTCVideoRotation_0;
+        case UIDeviceOrientationPortraitUpsideDown:
+            return RTCVideoRotation_180;
+        case UIDeviceOrientationLandscapeLeft:
+            // Device rotated left = screen shows landscape right
+            return RTCVideoRotation_270;
+        case UIDeviceOrientationLandscapeRight:
+            // Device rotated right = screen shows landscape left
+            return RTCVideoRotation_90;
+        default:
+            // Face up, face down, or unknown - default to no rotation
+            return RTCVideoRotation_0;
+    }
+}
+
+- (CGAffineTransform)videoTransformForCurrentDeviceOrientation {
+    UIDeviceOrientation deviceOrientation = [self currentDeviceOrientation];
+
+    // The pixel buffer is in portrait orientation (due to videoConnection.videoOrientation = Portrait)
+    // We need to apply a transform so the recorded video displays correctly based on how the user
+    // is holding the device.
+    switch (deviceOrientation) {
+        case UIDeviceOrientationPortrait:
+            return CGAffineTransformIdentity;
+        case UIDeviceOrientationPortraitUpsideDown:
+            return CGAffineTransformMakeRotation(M_PI);
+        case UIDeviceOrientationLandscapeLeft:
+            // Device rotated left = rotate video 90 degrees counter-clockwise
+            return CGAffineTransformMakeRotation(-M_PI_2);
+        case UIDeviceOrientationLandscapeRight:
+            // Device rotated right = rotate video 90 degrees clockwise
+            return CGAffineTransformMakeRotation(M_PI_2);
+        default:
+            // Face up, face down, or unknown - default to no rotation
+            return CGAffineTransformIdentity;
+    }
 }
 
 #pragma mark - Capture Control
@@ -263,11 +328,13 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
         // Stop recording first if active - must properly finalize to avoid corrupted files
         if (self.isRecording) {
-            // Flush pending frames
+            // Set isRecording to NO FIRST to stop accepting new frames
+            self.isRecording = NO;
+
+            // NOW flush pending frames - this blocks until all pending frames are processed
             if (self.compressionSession) {
                 VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
             }
-            self.isRecording = NO;
 
             // Clean up compression session
             if (self.compressionSession) {
@@ -293,6 +360,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             self.videoWriterInput = nil;
             self.audioWriterInput = nil;
             self.recordingURL = nil;
+            self.needsWriterSetup = NO;
             self.hasWrittenFirstVideoFrame = NO;
             self.recordingStartTime = kCMTimeInvalid;
         }
@@ -382,10 +450,18 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     return YES;
 }
 
-- (BOOL)setupAssetWriterAtURL:(NSURL *)url width:(int)width height:(int)height {
+- (BOOL)setupAssetWriterWithSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    // Extract format description from the compressed sample buffer
+    // This is the key fix - we need the format description for passthrough mode
+    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+    if (!formatDesc) {
+        NSLog(@"[HeyJoeCapturer] Failed to get format description from sample buffer");
+        return NO;
+    }
+
     NSError *error = nil;
 
-    self.assetWriter = [[AVAssetWriter alloc] initWithURL:url
+    self.assetWriter = [[AVAssetWriter alloc] initWithURL:self.recordingURL
                                                  fileType:AVFileTypeMPEG4
                                                     error:&error];
     if (error) {
@@ -393,13 +469,19 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         return NO;
     }
 
-    // Video input - passthrough mode (already compressed by VTCompressionSession)
+    // Video input - passthrough mode with sourceFormatHint (already compressed by VTCompressionSession)
+    // The sourceFormatHint tells AVAssetWriter what format to expect, allowing canAddInput to succeed
     self.videoWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                               outputSettings:nil];
+                                                               outputSettings:nil
+                                                             sourceFormatHint:formatDesc];
     self.videoWriterInput.expectsMediaDataInRealTime = YES;
 
-    // Set video transform for correct orientation
-    self.videoWriterInput.transform = CGAffineTransformIdentity;
+    // Apply rotation transform based on current device orientation
+    // The pixel buffer is always in portrait orientation (due to videoConnection.videoOrientation = Portrait)
+    // but we need to rotate the recorded video to match how the user is holding the device
+    CGAffineTransform videoTransform = [self videoTransformForCurrentDeviceOrientation];
+    self.videoWriterInput.transform = videoTransform;
+    NSLog(@"[HeyJoeCapturer] Video writer transform set for device orientation");
 
     // Audio input - encode to AAC
     AudioChannelLayout acl;
@@ -421,7 +503,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     if ([self.assetWriter canAddInput:self.videoWriterInput]) {
         [self.assetWriter addInput:self.videoWriterInput];
     } else {
-        NSLog(@"[HeyJoeCapturer] Cannot add video writer input");
+        NSLog(@"[HeyJoeCapturer] Cannot add video writer input - canAddInput returned NO");
+        NSLog(@"[HeyJoeCapturer] Asset writer error: %@", self.assetWriter.error);
         return NO;
     }
 
@@ -432,12 +515,35 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         // Continue without audio - video is more important
     }
 
-    NSLog(@"[HeyJoeCapturer] Asset writer created for: %@", url.path);
+    NSLog(@"[HeyJoeCapturer] Asset writer created with format hint for: %@", self.recordingURL.path);
     return YES;
 }
 
 - (void)handleCompressedFrame:(CMSampleBufferRef)sampleBuffer {
-    if (!self.isRecording || !self.assetWriter) return;
+    if (!self.isRecording) return;
+
+    // Deferred setup: create AVAssetWriter on first compressed frame
+    // This is needed because passthrough mode requires the format description
+    // from an actual compressed sample buffer
+    if (self.needsWriterSetup) {
+        NSLog(@"[HeyJoeCapturer] Performing deferred asset writer setup...");
+        if (![self setupAssetWriterWithSampleBuffer:sampleBuffer]) {
+            NSLog(@"[HeyJoeCapturer] Deferred asset writer setup failed - stopping recording");
+            self.isRecording = NO;
+            self.needsWriterSetup = NO;
+            // Cleanup compression session
+            if (self.compressionSession) {
+                VTCompressionSessionInvalidate(self.compressionSession);
+                CFRelease(self.compressionSession);
+                self.compressionSession = NULL;
+            }
+            return;
+        }
+        self.needsWriterSetup = NO;
+        NSLog(@"[HeyJoeCapturer] Deferred asset writer setup completed successfully");
+    }
+
+    if (!self.assetWriter) return;
 
     dispatch_sync(self.writerQueue, ^{
         if (self.assetWriter.status == AVAssetWriterStatusUnknown) {
@@ -468,6 +574,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 - (void)cleanupRecordingResources {
     self.isRecording = NO;
+    self.needsWriterSetup = NO;
     self.hasWrittenFirstVideoFrame = NO;
     self.recordingStartTime = kCMTimeInvalid;
 
@@ -519,36 +626,13 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.hasWrittenFirstVideoFrame = NO;
         self.recordingStartTime = kCMTimeInvalid;
 
-        // Setup compression session (VTCompressionSession for H.265 @ 20 Mbps)
-        if (![self setupCompressionSessionWithWidth:self.videoWidth height:self.videoHeight]) {
-            NSLog(@"[HeyJoeCapturer] Failed to setup compression session");
-            if (completionHandler) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completionHandler([NSError errorWithDomain:@"HeyJoeCapturer" code:5 userInfo:@{NSLocalizedDescriptionKey: @"Failed to setup compression"}]);
-                });
-            }
-            return;
-        }
-
-        // Setup asset writer
-        if (![self setupAssetWriterAtURL:outputURL width:self.videoWidth height:self.videoHeight]) {
-            // Cleanup compression session on failure
-            if (self.compressionSession) {
-                VTCompressionSessionInvalidate(self.compressionSession);
-                CFRelease(self.compressionSession);
-                self.compressionSession = NULL;
-            }
-            NSLog(@"[HeyJoeCapturer] Failed to setup asset writer");
-            if (completionHandler) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completionHandler([NSError errorWithDomain:@"HeyJoeCapturer" code:6 userInfo:@{NSLocalizedDescriptionKey: @"Failed to setup asset writer"}]);
-                });
-            }
-            return;
-        }
+        // Defer BOTH compression session AND asset writer setup until first pixel buffer
+        // This ensures we use the actual pixel buffer dimensions (which may be rotated
+        // based on videoOrientation setting) rather than camera format dimensions
+        self.needsWriterSetup = YES;
 
         self.isRecording = YES;
-        NSLog(@"[HeyJoeCapturer] Recording started at 20 Mbps to: %@", outputURL.path);
+        NSLog(@"[HeyJoeCapturer] Recording started at 20 Mbps to: %@ (writer setup deferred)", outputURL.path);
 
         if (completionHandler) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -572,16 +656,23 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
         NSURL *outputURL = self.recordingURL;
 
-        NSLog(@"[HeyJoeCapturer] Stopping recording...");
+        NSLog(@"[HeyJoeCapturer] Stopping recording - state: needsWriterSetup=%d, assetWriter=%@, compressionSession=%@",
+              self.needsWriterSetup,
+              self.assetWriter ? @"exists" : @"nil",
+              self.compressionSession ? @"exists" : @"nil");
 
-        // Flush compression session FIRST - complete all pending frames while still recording
-        // This ensures all frames are delivered to handleCompressedFrame before we stop
-        if (self.compressionSession) {
-            VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
-        }
-
-        // NOW set isRecording to NO - no more frames will be accepted
+        // Set isRecording to NO FIRST to stop accepting new frames
+        // This prevents a deadlock where VTCompressionSessionCompleteFrames blocks
+        // while new frames keep being added from captureOutput:
         self.isRecording = NO;
+        NSLog(@"[HeyJoeCapturer] isRecording set to NO - no more frames will be encoded");
+
+        // NOW flush the compression session - this will block until all pending frames are processed
+        if (self.compressionSession) {
+            NSLog(@"[HeyJoeCapturer] Flushing compression session...");
+            VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
+            NSLog(@"[HeyJoeCapturer] Compression session flushed");
+        }
 
         // Clean up compression session
         if (self.compressionSession) {
@@ -591,7 +682,28 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         }
 
         // Finish asset writer
-        if (self.assetWriter && self.assetWriter.status == AVAssetWriterStatusWriting) {
+        NSLog(@"[HeyJoeCapturer] Asset writer status check: assetWriter=%@, status=%ld",
+              self.assetWriter ? @"exists" : @"nil",
+              (long)(self.assetWriter ? self.assetWriter.status : -1));
+
+        // Handle case where recording stopped before any frames were written
+        if (self.needsWriterSetup || !self.assetWriter) {
+            NSLog(@"[HeyJoeCapturer] Recording stopped before any frames were processed");
+            [self cleanupRecordingResources];
+
+            if (completionHandler) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // Return nil URL but no error - recording was just too short
+                    completionHandler(nil, nil);
+                });
+            }
+            return;
+        }
+
+        AVAssetWriterStatus status = self.assetWriter.status;
+
+        if (status == AVAssetWriterStatusWriting) {
+            NSLog(@"[HeyJoeCapturer] Finishing asset writer...");
             [self.videoWriterInput markAsFinished];
             [self.audioWriterInput markAsFinished];
 
@@ -610,6 +722,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 self.videoWriterInput = nil;
                 self.audioWriterInput = nil;
                 self.recordingURL = nil;
+                self.needsWriterSetup = NO;
                 self.hasWrittenFirstVideoFrame = NO;
                 self.recordingStartTime = kCMTimeInvalid;
 
@@ -619,15 +732,30 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                     });
                 }
             }];
-        } else {
-            NSLog(@"[HeyJoeCapturer] Asset writer not in writing state: %ld, error: %@",
-                  (long)self.assetWriter.status, self.assetWriter.error);
-
+        } else if (status == AVAssetWriterStatusCompleted) {
+            // Already completed - this can happen in edge cases
+            NSLog(@"[HeyJoeCapturer] Asset writer already completed");
             [self cleanupRecordingResources];
 
             if (completionHandler) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    completionHandler(nil, [NSError errorWithDomain:@"HeyJoeCapturer" code:8 userInfo:@{NSLocalizedDescriptionKey: @"Recording failed"}]);
+                    completionHandler(outputURL, nil);
+                });
+            }
+        } else {
+            NSLog(@"[HeyJoeCapturer] Asset writer in unexpected state: %ld, error=%@",
+                  (long)status, self.assetWriter.error);
+
+            [self cleanupRecordingResources];
+
+            if (completionHandler) {
+                NSError *writerError = self.assetWriter.error;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (writerError) {
+                        completionHandler(nil, writerError);
+                    } else {
+                        completionHandler(nil, [NSError errorWithDomain:@"HeyJoeCapturer" code:8 userInfo:@{NSLocalizedDescriptionKey: @"Recording failed - writer not in expected state"}]);
+                    }
                 });
             }
         }
@@ -651,23 +779,58 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         int64_t timeStampNs = CMTimeGetSeconds(timestamp) * NSEC_PER_SEC;
 
         // Feed to WebRTC (always, regardless of recording)
+        // Get current device orientation and convert to RTCVideoRotation
+        RTCVideoRotation rotation = [self rtcVideoRotationForCurrentDeviceOrientation];
+
         RTCCVPixelBuffer *rtcPixelBuffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
         RTCVideoFrame *videoFrame = [[RTCVideoFrame alloc] initWithBuffer:rtcPixelBuffer
-                                                                 rotation:RTCVideoRotation_0
+                                                                 rotation:rotation
                                                               timeStampNs:timeStampNs];
         [self.delegate capturer:self didCaptureVideoFrame:videoFrame];
 
         // If recording, encode frame with VTCompressionSession
-        if (self.isRecording && self.compressionSession) {
-            VTCompressionSessionEncodeFrame(
-                self.compressionSession,
-                pixelBuffer,
-                timestamp,
-                kCMTimeInvalid,
-                NULL,
-                NULL,
-                NULL
-            );
+        if (self.isRecording) {
+            // Deferred compression session setup - use actual pixel buffer dimensions
+            if (self.needsWriterSetup && !self.compressionSession) {
+                int actualWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
+                int actualHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
+                NSLog(@"[HeyJoeCapturer] Setting up compression session with actual pixel buffer dimensions: %dx%d", actualWidth, actualHeight);
+
+                if (![self setupCompressionSessionWithWidth:actualWidth height:actualHeight]) {
+                    NSLog(@"[HeyJoeCapturer] Failed to setup compression session");
+                    self.isRecording = NO;
+                    self.needsWriterSetup = NO;
+                    return;
+                }
+            }
+
+            if (self.compressionSession) {
+                static int frameCount = 0;
+                // Reset frame count at start of new recording
+                if (self.needsWriterSetup) {
+                    frameCount = 0;
+                }
+                frameCount++;
+                if (frameCount <= 3) {
+                    size_t pbWidth = CVPixelBufferGetWidth(pixelBuffer);
+                    size_t pbHeight = CVPixelBufferGetHeight(pixelBuffer);
+                    NSLog(@"[HeyJoeCapturer] Frame #%d - PixelBuffer: %zux%zu", frameCount, pbWidth, pbHeight);
+                } else if (frameCount % 30 == 0) {
+                    NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", frameCount);
+                }
+                OSStatus status = VTCompressionSessionEncodeFrame(
+                    self.compressionSession,
+                    pixelBuffer,
+                    timestamp,
+                    kCMTimeInvalid,
+                    NULL,
+                    NULL,
+                    NULL
+                );
+                if (status != noErr) {
+                    NSLog(@"[HeyJoeCapturer] VTCompressionSessionEncodeFrame failed with status: %d", (int)status);
+                }
+            }
         }
     }
     // Handle audio frames
@@ -686,6 +849,61 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 }
 
 #pragma mark - Helper Methods
+
+- (CGAffineTransform)currentVideoTransform {
+    // Get the current device orientation
+    // Must be called on main thread to access UIDevice
+    __block UIDeviceOrientation deviceOrientation;
+    if ([NSThread isMainThread]) {
+        deviceOrientation = [UIDevice currentDevice].orientation;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            deviceOrientation = [UIDevice currentDevice].orientation;
+        });
+    }
+
+    // Determine if we're using front camera (for mirroring consideration)
+    BOOL isFrontCamera = (self.videoInput.device.position == AVCaptureDevicePositionFront);
+
+    // Calculate the appropriate rotation based on device orientation
+    // The camera sensor is in landscape orientation, so we need to rotate for proper playback
+    CGAffineTransform transform;
+
+    switch (deviceOrientation) {
+        case UIDeviceOrientationPortrait:
+            // Phone held normally (home button at bottom)
+            transform = CGAffineTransformMakeRotation(-M_PI_2);  // 90° counter-clockwise
+            break;
+
+        case UIDeviceOrientationPortraitUpsideDown:
+            // Phone upside down (home button at top)
+            transform = CGAffineTransformMakeRotation(M_PI_2);  // 90° clockwise
+            break;
+
+        case UIDeviceOrientationLandscapeLeft:
+            // Phone rotated left (home button on right)
+            transform = CGAffineTransformIdentity;  // No rotation
+            break;
+
+        case UIDeviceOrientationLandscapeRight:
+            // Phone rotated right (home button on left)
+            transform = CGAffineTransformMakeRotation(M_PI);  // 180°
+            break;
+
+        case UIDeviceOrientationFaceUp:
+        case UIDeviceOrientationFaceDown:
+        case UIDeviceOrientationUnknown:
+        default:
+            // Default to portrait if orientation is unclear
+            transform = CGAffineTransformMakeRotation(-M_PI_2);
+            break;
+    }
+
+    NSLog(@"[HeyJoeCapturer] Video transform for orientation %ld (front camera: %d)",
+          (long)deviceOrientation, isFrontCamera);
+
+    return transform;
+}
 
 + (AVCaptureDeviceFormat *)bestFormatForDevice:(AVCaptureDevice *)device
                                targetFrameRate:(NSInteger)fps {
@@ -753,12 +971,21 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                                        OSStatus status,
                                        VTEncodeInfoFlags infoFlags,
                                        CMSampleBufferRef sampleBuffer) {
+    static int callbackCount = 0;
+    callbackCount++;
+    if (callbackCount <= 3 || callbackCount % 30 == 0) {
+        NSLog(@"[HeyJoeCapturer] Compression callback #%d, status=%d", callbackCount, (int)status);
+    }
+
     if (status != noErr) {
         NSLog(@"[HeyJoeCapturer] Compression error: %d", (int)status);
         return;
     }
 
-    if (!sampleBuffer) return;
+    if (!sampleBuffer) {
+        NSLog(@"[HeyJoeCapturer] Compression callback: sampleBuffer is NULL");
+        return;
+    }
 
     // Retain sample buffer for async handling
     CFRetain(sampleBuffer);
