@@ -73,11 +73,12 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _videoHeight = 720;
         _hasWrittenFirstVideoFrame = NO;
         _recordingStartTime = kCMTimeInvalid;
+        _recordingTargetResolution = HeyJoeRecordingResolution1080p;
 
         // Set as shared instance
         [HeyJoeVideoCapturer setSharedInstance:self];
 
-        NSLog(@"[HeyJoeCapturer] Initialized with 20 Mbps bitrate control");
+        NSLog(@"[HeyJoeCapturer] Initialized with recording quality support (default: 1080p)");
     }
     return self;
 }
@@ -386,7 +387,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 #pragma mark - Recording Control
 
-- (BOOL)setupCompressionSessionWithWidth:(int)width height:(int)height {
+- (BOOL)setupCompressionSessionWithWidth:(int)width height:(int)height bitrate:(int)bitrate {
     // HEVC encoding requires iOS 11.0+
     if (@available(iOS 11.0, *)) {
         // iOS 11+ - use HEVC
@@ -413,8 +414,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         return NO;
     }
 
-    // Set 20 Mbps bitrate for high quality recording
-    int bitrate = 20000000;
+    // Set bitrate for recording quality
     VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_AverageBitRate,
                          (__bridge CFNumberRef)@(bitrate));
 
@@ -446,7 +446,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     VTCompressionSessionPrepareToEncodeFrames(_compressionSession);
 
-    NSLog(@"[HeyJoeCapturer] Compression session created: %dx%d @ 20 Mbps H.265", width, height);
+    NSLog(@"[HeyJoeCapturer] Compression session created: %dx%d @ %d Mbps H.265", width, height, bitrate / 1000000);
     return YES;
 }
 
@@ -632,7 +632,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.needsWriterSetup = YES;
 
         self.isRecording = YES;
-        NSLog(@"[HeyJoeCapturer] Recording started at 20 Mbps to: %@ (writer setup deferred)", outputURL.path);
+        NSLog(@"[HeyJoeCapturer] Recording started (target: %s) to: %@ (writer setup deferred)",
+              self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p",
+              outputURL.path);
 
         if (completionHandler) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -791,12 +793,34 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         // If recording, encode frame with VTCompressionSession
         if (self.isRecording) {
             // Deferred compression session setup - use actual pixel buffer dimensions
+            // Apply resolution cap based on recordingTargetResolution setting
             if (self.needsWriterSetup && !self.compressionSession) {
                 int actualWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
                 int actualHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
-                NSLog(@"[HeyJoeCapturer] Setting up compression session with actual pixel buffer dimensions: %dx%d", actualWidth, actualHeight);
+                NSLog(@"[HeyJoeCapturer] Actual pixel buffer dimensions: %dx%d", actualWidth, actualHeight);
 
-                if (![self setupCompressionSessionWithWidth:actualWidth height:actualHeight]) {
+                int targetWidth = actualWidth;
+                int targetHeight = actualHeight;
+                int bitrate = 20000000; // 20 Mbps for 4K
+
+                if (self.recordingTargetResolution == HeyJoeRecordingResolution1080p) {
+                    if (actualWidth > actualHeight) {
+                        // Landscape
+                        targetWidth = MIN(actualWidth, 1920);
+                        targetHeight = MIN(actualHeight, 1080);
+                    } else {
+                        // Portrait
+                        targetWidth = MIN(actualWidth, 1080);
+                        targetHeight = MIN(actualHeight, 1920);
+                    }
+                    bitrate = 8000000; // 8 Mbps for 1080p
+                }
+
+                NSLog(@"[HeyJoeCapturer] Setting up compression session: %dx%d @ %d Mbps (target: %s)",
+                      targetWidth, targetHeight, bitrate / 1000000,
+                      self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p");
+
+                if (![self setupCompressionSessionWithWidth:targetWidth height:targetHeight bitrate:bitrate]) {
                     NSLog(@"[HeyJoeCapturer] Failed to setup compression session");
                     self.isRecording = NO;
                     self.needsWriterSetup = NO;
