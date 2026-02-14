@@ -780,11 +780,32 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
         int64_t timeStampNs = CMTimeGetSeconds(timestamp) * NSEC_PER_SEC;
 
-        // Feed to WebRTC (always, regardless of recording)
-        // Get current device orientation and convert to RTCVideoRotation
+        // Feed to WebRTC at 720p (always, regardless of recording)
+        // Camera stays at native resolution for local recording, but WebRTC
+        // only needs 720p. RTCCVPixelBuffer handles the scaling efficiently.
         RTCVideoRotation rotation = [self rtcVideoRotationForCurrentDeviceOrientation];
 
-        RTCCVPixelBuffer *rtcPixelBuffer = [[RTCCVPixelBuffer alloc] initWithPixelBuffer:pixelBuffer];
+        int pbWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
+        int pbHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
+
+        // Target 720p for WebRTC: 1280x720 landscape, 720x1280 portrait
+        int adaptedWidth, adaptedHeight;
+        if (pbWidth > pbHeight) {
+            adaptedWidth = MIN(pbWidth, 1280);
+            adaptedHeight = MIN(pbHeight, 720);
+        } else {
+            adaptedWidth = MIN(pbWidth, 720);
+            adaptedHeight = MIN(pbHeight, 1280);
+        }
+
+        RTCCVPixelBuffer *rtcPixelBuffer = [[RTCCVPixelBuffer alloc]
+            initWithPixelBuffer:pixelBuffer
+                   adaptedWidth:adaptedWidth
+                  adaptedHeight:adaptedHeight
+                      cropWidth:pbWidth
+                     cropHeight:pbHeight
+                          cropX:0
+                          cropY:0];
         RTCVideoFrame *videoFrame = [[RTCVideoFrame alloc] initWithBuffer:rtcPixelBuffer
                                                                  rotation:rotation
                                                               timeStampNs:timeStampNs];
