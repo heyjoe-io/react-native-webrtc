@@ -43,6 +43,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 @property (nonatomic, copy, nullable) void (^recordingCompletionHandler)(NSURL * _Nullable, NSError * _Nullable);
 
+// Per-session counters (replaces statics to avoid cross-session confusion)
+@property (nonatomic, assign) int encodedFrameCount;
+@property (nonatomic, assign) int compressedCallbackCount;
+
 @end
 
 @implementation HeyJoeVideoCapturer
@@ -74,6 +78,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _hasWrittenFirstVideoFrame = NO;
         _recordingStartTime = kCMTimeInvalid;
         _recordingTargetResolution = HeyJoeRecordingResolution1080p;
+        _encodedFrameCount = 0;
+        _compressedCallbackCount = 0;
 
         // Set as shared instance
         [HeyJoeVideoCapturer setSharedInstance:self];
@@ -329,6 +335,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
         // Stop recording first if active - must properly finalize to avoid corrupted files
         if (self.isRecording) {
+            NSLog(@"[HeyJoeCapturer] Recording was active during capture stop - cleaning up and notifying JS");
+
             // Set isRecording to NO FIRST to stop accepting new frames
             self.isRecording = NO;
 
@@ -364,6 +372,13 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             self.needsWriterSetup = NO;
             self.hasWrittenFirstVideoFrame = NO;
             self.recordingStartTime = kCMTimeInvalid;
+
+            // Notify bridge module so it can sync JS recording state
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [[NSNotificationCenter defaultCenter]
+                    postNotificationName:@"HeyJoeRecordingInterruptedDuringCaptureStop"
+                    object:nil];
+            });
         }
 
         [self.captureSession stopRunning];
@@ -616,6 +631,26 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             return;
         }
 
+        // Pre-recording cleanup: force-clean any stale resources from a previous
+        // session that was interrupted by a room transition
+        if (self.compressionSession) {
+            NSLog(@"[HeyJoeCapturer] Cleaning up stale compression session before new recording");
+            VTCompressionSessionInvalidate(self.compressionSession);
+            CFRelease(self.compressionSession);
+            self.compressionSession = NULL;
+        }
+        if (self.assetWriter) {
+            NSLog(@"[HeyJoeCapturer] Cleaning up stale asset writer before new recording (status=%ld)",
+                  (long)self.assetWriter.status);
+            [self.assetWriter cancelWriting];
+            self.assetWriter = nil;
+            self.videoWriterInput = nil;
+            self.audioWriterInput = nil;
+        }
+        self.needsWriterSetup = NO;
+        self.hasWrittenFirstVideoFrame = NO;
+        self.recordingStartTime = kCMTimeInvalid;
+
         // Delete existing file if present
         NSFileManager *fileManager = [NSFileManager defaultManager];
         if ([fileManager fileExistsAtPath:outputURL.path]) {
@@ -625,6 +660,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.recordingURL = outputURL;
         self.hasWrittenFirstVideoFrame = NO;
         self.recordingStartTime = kCMTimeInvalid;
+        self.encodedFrameCount = 0;
+        self.compressedCallbackCount = 0;
 
         // Defer BOTH compression session AND asset writer setup until first pixel buffer
         // This ensures we use the actual pixel buffer dimensions (which may be rotated
@@ -745,18 +782,23 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 });
             }
         } else {
+            // Capture error BEFORE cleanup nils the assetWriter
+            NSError *writerError = self.assetWriter.error;
+            AVAssetWriterStatus writerStatus = status;
             NSLog(@"[HeyJoeCapturer] Asset writer in unexpected state: %ld, error=%@",
-                  (long)status, self.assetWriter.error);
+                  (long)writerStatus, writerError);
 
             [self cleanupRecordingResources];
 
             if (completionHandler) {
-                NSError *writerError = self.assetWriter.error;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (writerError) {
                         completionHandler(nil, writerError);
                     } else {
-                        completionHandler(nil, [NSError errorWithDomain:@"HeyJoeCapturer" code:8 userInfo:@{NSLocalizedDescriptionKey: @"Recording failed - writer not in expected state"}]);
+                        NSString *desc = [NSString stringWithFormat:
+                            @"Recording failed - writer in state %ld (0=Unknown,3=Failed,4=Cancelled)",
+                            (long)writerStatus];
+                        completionHandler(nil, [NSError errorWithDomain:@"HeyJoeCapturer" code:8 userInfo:@{NSLocalizedDescriptionKey: desc}]);
                     }
                 });
             }
@@ -850,18 +892,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             }
 
             if (self.compressionSession) {
-                static int frameCount = 0;
-                // Reset frame count at start of new recording
-                if (self.needsWriterSetup) {
-                    frameCount = 0;
-                }
-                frameCount++;
-                if (frameCount <= 3) {
+                self.encodedFrameCount++;
+                if (self.encodedFrameCount <= 3) {
                     size_t pbWidth = CVPixelBufferGetWidth(pixelBuffer);
                     size_t pbHeight = CVPixelBufferGetHeight(pixelBuffer);
-                    NSLog(@"[HeyJoeCapturer] Frame #%d - PixelBuffer: %zux%zu", frameCount, pbWidth, pbHeight);
-                } else if (frameCount % 30 == 0) {
-                    NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", frameCount);
+                    NSLog(@"[HeyJoeCapturer] Frame #%d - PixelBuffer: %zux%zu", self.encodedFrameCount, pbWidth, pbHeight);
+                } else if (self.encodedFrameCount % 30 == 0) {
+                    NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", self.encodedFrameCount);
                 }
                 OSStatus status = VTCompressionSessionEncodeFrame(
                     self.compressionSession,
@@ -1132,10 +1169,11 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                                        OSStatus status,
                                        VTEncodeInfoFlags infoFlags,
                                        CMSampleBufferRef sampleBuffer) {
-    static int callbackCount = 0;
-    callbackCount++;
-    if (callbackCount <= 3 || callbackCount % 30 == 0) {
-        NSLog(@"[HeyJoeCapturer] Compression callback #%d, status=%d", callbackCount, (int)status);
+    if (!outputCallbackRefCon) return;
+    HeyJoeVideoCapturer *capturer = (__bridge HeyJoeVideoCapturer *)outputCallbackRefCon;
+    capturer.compressedCallbackCount++;
+    if (capturer.compressedCallbackCount <= 3 || capturer.compressedCallbackCount % 30 == 0) {
+        NSLog(@"[HeyJoeCapturer] Compression callback #%d, status=%d", capturer.compressedCallbackCount, (int)status);
     }
 
     if (status != noErr) {
@@ -1151,7 +1189,6 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     // Retain sample buffer for async handling
     CFRetain(sampleBuffer);
 
-    HeyJoeVideoCapturer *capturer = (__bridge HeyJoeVideoCapturer *)outputCallbackRefCon;
     [capturer handleCompressedFrame:sampleBuffer];
 
     CFRelease(sampleBuffer);
