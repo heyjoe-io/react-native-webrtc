@@ -28,6 +28,9 @@ typedef NS_ENUM(NSInteger, HeyJoeRecordingResolution) {
 /// Current recording state
 @property (nonatomic, assign, readonly) BOOL isRecording;
 
+/// Whether the capture session is running
+@property (nonatomic, assign, readonly) BOOL isCapturing;
+
 /// Current video dimensions
 @property (nonatomic, assign, readonly) int videoWidth;
 @property (nonatomic, assign, readonly) int videoHeight;
