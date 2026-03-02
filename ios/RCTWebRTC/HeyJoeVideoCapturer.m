@@ -43,6 +43,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 @property (nonatomic, copy, nullable) void (^recordingCompletionHandler)(NSURL * _Nullable, NSError * _Nullable);
 
+// Captures mid-recording setup errors (e.g. startWriting failure) so they can be
+// reported when stopRecording is called, instead of silently limping along.
+@property (nonatomic, strong, nullable) NSError *recordingSetupError;
+
 // Per-session counters (replaces statics to avoid cross-session confusion)
 @property (nonatomic, assign) int encodedFrameCount;
 @property (nonatomic, assign) int compressedCallbackCount;
@@ -476,6 +480,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     NSError *error = nil;
 
+    // Defensive: ensure no file exists at the recording URL.
+    // AVAssetWriter requires the URL to be free of existing files.
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:self.recordingURL.path]) {
+        NSLog(@"[HeyJoeCapturer] WARNING: File already exists at recording URL during deferred setup - deleting");
+        [fm removeItemAtURL:self.recordingURL error:nil];
+    }
+
     self.assetWriter = [[AVAssetWriter alloc] initWithURL:self.recordingURL
                                                  fileType:AVFileTypeMPEG4
                                                     error:&error];
@@ -537,6 +549,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 - (void)handleCompressedFrame:(CMSampleBufferRef)sampleBuffer {
     if (!self.isRecording) return;
 
+    // Guard against stale callbacks from a previous (invalidated) compression session.
+    // After a room transition, the old session is invalidated but in-flight callbacks may
+    // still arrive. If compressionSession is NULL, this frame is from a dead session.
+    if (!self.compressionSession) {
+        NSLog(@"[HeyJoeCapturer] Ignoring compressed frame - no active compression session (stale callback?)");
+        return;
+    }
+
     // Deferred setup: create AVAssetWriter on first compressed frame
     // This is needed because passthrough mode requires the format description
     // from an actual compressed sample buffer
@@ -568,7 +588,12 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 self.recordingStartTime = timestamp;
                 NSLog(@"[HeyJoeCapturer] Asset writer started at time: %.3f", CMTimeGetSeconds(timestamp));
             } else {
-                NSLog(@"[HeyJoeCapturer] Failed to start asset writer: %@", self.assetWriter.error);
+                NSError *writerErr = self.assetWriter.error;
+                NSLog(@"[HeyJoeCapturer] CRITICAL: startWriting failed - status=%ld, error=%@, URL=%@",
+                      (long)self.assetWriter.status, writerErr, self.recordingURL);
+                self.recordingSetupError = writerErr ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:10
+                    userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}];
+                self.isRecording = NO;
                 return;
             }
         }
@@ -578,11 +603,22 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 if ([self.videoWriterInput appendSampleBuffer:sampleBuffer]) {
                     self.hasWrittenFirstVideoFrame = YES;
                 } else {
-                    NSLog(@"[HeyJoeCapturer] Failed to append video sample: %@", self.assetWriter.error);
+                    NSError *appendErr = self.assetWriter.error;
+                    NSLog(@"[HeyJoeCapturer] CRITICAL: Failed to append video sample - status=%ld, error=%@",
+                          (long)self.assetWriter.status, appendErr);
+                    // If writer transitioned to Failed, stop recording immediately
+                    if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                        self.recordingSetupError = appendErr;
+                        self.isRecording = NO;
+                    }
                 }
             }
         } else if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-            NSLog(@"[HeyJoeCapturer] Asset writer failed: %@", self.assetWriter.error);
+            NSLog(@"[HeyJoeCapturer] Asset writer in failed state: %@", self.assetWriter.error);
+            if (!self.recordingSetupError) {
+                self.recordingSetupError = self.assetWriter.error;
+            }
+            self.isRecording = NO;
         }
     });
 }
@@ -592,6 +628,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     self.needsWriterSetup = NO;
     self.hasWrittenFirstVideoFrame = NO;
     self.recordingStartTime = kCMTimeInvalid;
+    self.recordingSetupError = nil;
 
     // Cleanup compression session
     if (self.compressionSession) {
@@ -660,6 +697,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.recordingURL = outputURL;
         self.hasWrittenFirstVideoFrame = NO;
         self.recordingStartTime = kCMTimeInvalid;
+        self.recordingSetupError = nil;
         self.encodedFrameCount = 0;
         self.compressedCallbackCount = 0;
 
@@ -683,6 +721,22 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 - (void)stopRecordingWithCompletionHandler:(void (^)(NSURL *, NSError *))completionHandler {
     dispatch_async(self.sessionQueue, ^{
+        // Check for mid-recording setup errors (e.g. startWriting failed, frame append failed).
+        // In this case isRecording was set to NO by handleCompressedFrame, but the error
+        // hasn't been reported yet. Report it now.
+        if (!self.isRecording && self.recordingSetupError) {
+            NSError *setupErr = self.recordingSetupError;
+            self.recordingSetupError = nil;
+            NSLog(@"[HeyJoeCapturer] Reporting deferred recording setup error: %@", setupErr);
+            [self cleanupRecordingResources];
+            if (completionHandler) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completionHandler(nil, setupErr);
+                });
+            }
+            return;
+        }
+
         if (!self.isRecording) {
             NSLog(@"[HeyJoeCapturer] Not recording, nothing to stop");
             if (completionHandler) {
@@ -747,6 +801,27 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             [self.audioWriterInput markAsFinished];
 
             [self.assetWriter finishWritingWithCompletionHandler:^{
+                AVAssetWriterStatus finalStatus = self.assetWriter.status;
+                NSError *finalError = self.assetWriter.error;
+
+                if (finalStatus == AVAssetWriterStatusFailed) {
+                    NSLog(@"[HeyJoeCapturer] finishWriting completed but writer FAILED: %@", finalError);
+                    self.assetWriter = nil;
+                    self.videoWriterInput = nil;
+                    self.audioWriterInput = nil;
+                    self.recordingURL = nil;
+                    self.needsWriterSetup = NO;
+                    self.hasWrittenFirstVideoFrame = NO;
+                    self.recordingStartTime = kCMTimeInvalid;
+                    if (completionHandler) {
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            completionHandler(nil, finalError ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:11
+                                userInfo:@{NSLocalizedDescriptionKey: @"Recording finalization failed"}]);
+                        });
+                    }
+                    return;
+                }
+
                 NSLog(@"[HeyJoeCapturer] Recording finished: %@", outputURL.path);
 
                 // Get file size for logging
@@ -922,7 +997,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 if (self.assetWriter.status == AVAssetWriterStatusWriting &&
                     self.audioWriterInput.readyForMoreMediaData) {
                     if (![self.audioWriterInput appendSampleBuffer:sampleBuffer]) {
-                        NSLog(@"[HeyJoeCapturer] Failed to append audio sample: %@", self.assetWriter.error);
+                        NSError *audioErr = self.assetWriter.error;
+                        NSLog(@"[HeyJoeCapturer] Failed to append audio sample - status=%ld, error=%@",
+                              (long)self.assetWriter.status, audioErr);
+                        // If writer entered Failed state from audio append, stop recording
+                        if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                            self.recordingSetupError = audioErr;
+                            self.isRecording = NO;
+                        }
                     }
                 }
             });
