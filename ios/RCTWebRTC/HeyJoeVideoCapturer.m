@@ -566,12 +566,15 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             NSLog(@"[HeyJoeCapturer] Deferred asset writer setup failed - stopping recording");
             self.isRecording = NO;
             self.needsWriterSetup = NO;
+            self.recordingSetupError = [NSError errorWithDomain:@"HeyJoeCapturer" code:12
+                userInfo:@{NSLocalizedDescriptionKey: @"Asset writer setup failed"}];
             // Cleanup compression session
             if (self.compressionSession) {
                 VTCompressionSessionInvalidate(self.compressionSession);
                 CFRelease(self.compressionSession);
                 self.compressionSession = NULL;
             }
+            [self notifyRecordingFailedWithError:self.recordingSetupError];
             return;
         }
         self.needsWriterSetup = NO;
@@ -594,6 +597,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 self.recordingSetupError = writerErr ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:10
                     userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}];
                 self.isRecording = NO;
+                [self notifyRecordingFailedWithError:self.recordingSetupError];
                 return;
             }
         }
@@ -610,6 +614,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                     if (self.assetWriter.status == AVAssetWriterStatusFailed) {
                         self.recordingSetupError = appendErr;
                         self.isRecording = NO;
+                        [self notifyRecordingFailedWithError:appendErr];
                     }
                 }
             }
@@ -619,7 +624,18 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 self.recordingSetupError = self.assetWriter.error;
             }
             self.isRecording = NO;
+            [self notifyRecordingFailedWithError:self.recordingSetupError];
         }
+    });
+}
+
+- (void)notifyRecordingFailedWithError:(NSError *)error {
+    NSLog(@"[HeyJoeCapturer] Notifying JS of recording failure: %@", error);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:@"HeyJoeRecordingFailedMidStream"
+            object:nil
+            userInfo:error ? @{@"error": error.localizedDescription ?: @"Unknown error"} : nil];
     });
 }
 
@@ -1004,6 +1020,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                         if (self.assetWriter.status == AVAssetWriterStatusFailed) {
                             self.recordingSetupError = audioErr;
                             self.isRecording = NO;
+                            [self notifyRecordingFailedWithError:audioErr];
                         }
                     }
                 }
