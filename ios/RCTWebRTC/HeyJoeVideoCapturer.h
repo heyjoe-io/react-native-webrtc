@@ -42,6 +42,10 @@ typedef NS_ENUM(NSInteger, HeyJoeRecordingResolution) {
 /// Initialize with delegate (typically RTCVideoSource)
 - (instancetype)initWithDelegate:(id<RTCVideoCapturerDelegate>)delegate;
 
+/// Update the delegate for a new WebRTC session (reuses existing capturer instance)
+/// Stops any active capture/recording, then updates the weak delegate reference.
+- (void)updateDelegate:(id<RTCVideoCapturerDelegate>)delegate;
+
 /// Start capturing from the specified camera
 - (void)startCaptureWithDevice:(AVCaptureDevice *)device
                         format:(AVCaptureDeviceFormat *)format

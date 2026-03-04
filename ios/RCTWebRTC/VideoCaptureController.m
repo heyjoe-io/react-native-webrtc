@@ -57,11 +57,18 @@
             self.usingFrontCamera = position == AVCaptureDevicePositionFront;
         }
 
-        // Create our HeyJoeVideoCapturer using the same delegate as the original capturer
-        // The delegate is the RTCVideoSource that feeds into WebRTC
-        self.heyJoeCapturer = [[HeyJoeVideoCapturer alloc] initWithDelegate:capturer.delegate];
-
-        RCTLog(@"[VideoCaptureController] Initialized with HeyJoeVideoCapturer for unified capture");
+        // Reuse existing HeyJoeVideoCapturer singleton if available.
+        // Creating a new instance per room join causes dangling pointer crashes
+        // when the old instance's compression callbacks are still in-flight.
+        HeyJoeVideoCapturer *existing = [HeyJoeVideoCapturer sharedInstance];
+        if (existing) {
+            [existing updateDelegate:capturer.delegate];
+            self.heyJoeCapturer = existing;
+            RCTLog(@"[VideoCaptureController] Reusing existing HeyJoeVideoCapturer instance");
+        } else {
+            self.heyJoeCapturer = [[HeyJoeVideoCapturer alloc] initWithDelegate:capturer.delegate];
+            RCTLog(@"[VideoCaptureController] Created new HeyJoeVideoCapturer instance");
+        }
     }
 
     return self;

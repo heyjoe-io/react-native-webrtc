@@ -51,6 +51,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 @property (nonatomic, assign) int encodedFrameCount;
 @property (nonatomic, assign) int compressedCallbackCount;
 
+// Cached device orientation — updated via notification instead of per-frame dispatch_sync to main queue
+@property (nonatomic, assign) UIDeviceOrientation cachedDeviceOrientation;
+
 @end
 
 @implementation HeyJoeVideoCapturer
@@ -85,12 +88,51 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _encodedFrameCount = 0;
         _compressedCallbackCount = 0;
 
+        // Cache device orientation — avoids 30x/sec dispatch_sync to main queue
+        _cachedDeviceOrientation = UIDeviceOrientationPortrait;
+        [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(deviceOrientationDidChange:)
+                                                     name:UIDeviceOrientationDidChangeNotification
+                                                   object:nil];
+
+        // Stop recording gracefully on memory pressure instead of letting the system kill us
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleMemoryWarning:)
+                                                     name:UIApplicationDidReceiveMemoryWarningNotification
+                                                   object:nil];
+
         // Set as shared instance
         [HeyJoeVideoCapturer setSharedInstance:self];
 
         NSLog(@"[HeyJoeCapturer] Initialized with recording quality support (default: 1080p)");
     }
     return self;
+}
+
+- (void)updateDelegate:(id<RTCVideoCapturerDelegate>)delegate {
+    // Stop any active capture/recording first, then update the delegate
+    // for the new WebRTC session. This avoids creating a new instance
+    // which would cause dangling pointer crashes in compression callbacks.
+    if (self.isCapturing) {
+        dispatch_sync(self.sessionQueue, ^{
+            if (self.isRecording) {
+                [self cleanupRecordingResources];
+            }
+            if (self.captureSession && self.captureSession.isRunning) {
+                [self.captureSession stopRunning];
+            }
+            self.captureSession = nil;
+            self.videoInput = nil;
+            self.audioInput = nil;
+            self.videoDataOutput = nil;
+            self.audioDataOutput = nil;
+            self.isCapturing = NO;
+        });
+    }
+    // RTCVideoCapturer stores the delegate as a weak reference
+    self.delegate = delegate;
+    NSLog(@"[HeyJoeCapturer] Delegate updated for new WebRTC session");
 }
 
 - (void)dealloc {
@@ -117,6 +159,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         });
     }
 
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
+
     if (_sharedInstance == self) {
         _sharedInstance = nil;
     }
@@ -125,17 +170,23 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 #pragma mark - Orientation Handling
 
-- (UIDeviceOrientation)currentDeviceOrientation {
-    // Get device orientation - must be called on main thread
-    __block UIDeviceOrientation deviceOrientation;
-    if ([NSThread isMainThread]) {
-        deviceOrientation = [UIDevice currentDevice].orientation;
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            deviceOrientation = [UIDevice currentDevice].orientation;
-        });
+- (void)deviceOrientationDidChange:(NSNotification *)notification {
+    self.cachedDeviceOrientation = [UIDevice currentDevice].orientation;
+}
+
+- (void)handleMemoryWarning:(NSNotification *)notification {
+    NSLog(@"[HeyJoeCapturer] MEMORY WARNING received");
+    if (self.isRecording) {
+        NSLog(@"[HeyJoeCapturer] Stopping recording due to memory pressure");
+        self.recordingSetupError = [NSError errorWithDomain:@"HeyJoeCapturer" code:20
+            userInfo:@{NSLocalizedDescriptionKey: @"Recording stopped due to low memory"}];
+        self.isRecording = NO;
+        [self notifyRecordingFailedWithError:self.recordingSetupError];
     }
-    return deviceOrientation;
+}
+
+- (UIDeviceOrientation)currentDeviceOrientation {
+    return self.cachedDeviceOrientation;
 }
 
 - (RTCVideoRotation)rtcVideoRotationForCurrentDeviceOrientation {
@@ -583,7 +634,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     if (!self.assetWriter) return;
 
-    dispatch_sync(self.writerQueue, ^{
+    // Async dispatch to avoid blocking the VideoToolbox compression callback thread.
+    // At 4K 20Mbps, synchronous writes create cascading backpressure through the pipeline.
+    CFRetain(sampleBuffer);
+    dispatch_async(self.writerQueue, ^{
         if (self.assetWriter.status == AVAssetWriterStatusUnknown) {
             CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
             if ([self.assetWriter startWriting]) {
@@ -598,6 +652,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                     userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}];
                 self.isRecording = NO;
                 [self notifyRecordingFailedWithError:self.recordingSetupError];
+                CFRelease(sampleBuffer);
                 return;
             }
         }
@@ -626,6 +681,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             self.isRecording = NO;
             [self notifyRecordingFailedWithError:self.recordingSetupError];
         }
+        CFRelease(sampleBuffer);
     });
 }
 
@@ -776,11 +832,22 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.isRecording = NO;
         NSLog(@"[HeyJoeCapturer] isRecording set to NO - no more frames will be encoded");
 
-        // NOW flush the compression session - this will block until all pending frames are processed
+        // Flush compression session with a timeout to prevent indefinite blocking.
+        // With async writer dispatch (Fix 2), there can be backpressure from disk I/O.
         if (self.compressionSession) {
             NSLog(@"[HeyJoeCapturer] Flushing compression session...");
-            VTCompressionSessionCompleteFrames(self.compressionSession, kCMTimeInvalid);
-            NSLog(@"[HeyJoeCapturer] Compression session flushed");
+            dispatch_semaphore_t flushSem = dispatch_semaphore_create(0);
+            VTCompressionSessionRef sessionToFlush = self.compressionSession;
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                VTCompressionSessionCompleteFrames(sessionToFlush, kCMTimeInvalid);
+                dispatch_semaphore_signal(flushSem);
+            });
+            long flushResult = dispatch_semaphore_wait(flushSem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+            if (flushResult != 0) {
+                NSLog(@"[HeyJoeCapturer] WARNING: Compression flush timed out after 5s");
+            } else {
+                NSLog(@"[HeyJoeCapturer] Compression session flushed");
+            }
         }
 
         // Clean up compression session
@@ -789,6 +856,12 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             CFRelease(self.compressionSession);
             self.compressionSession = NULL;
         }
+
+        // Drain the writer queue to ensure all async writes from handleCompressedFrame
+        // and audio handler complete before we finalize the asset writer.
+        dispatch_sync(self.writerQueue, ^{
+            NSLog(@"[HeyJoeCapturer] Writer queue drained");
+        });
 
         // Finish asset writer
         NSLog(@"[HeyJoeCapturer] Asset writer status check: assetWriter=%@, status=%ld",
@@ -1009,7 +1082,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     // Handle audio frames
     else if (output == self.audioDataOutput) {
         if (self.isRecording && self.hasWrittenFirstVideoFrame) {
-            dispatch_sync(self.writerQueue, ^{
+            CFRetain(sampleBuffer);
+            dispatch_async(self.writerQueue, ^{
                 if (self.assetWriter.status == AVAssetWriterStatusWriting &&
                     self.audioWriterInput.readyForMoreMediaData) {
                     if (![self.audioWriterInput appendSampleBuffer:sampleBuffer]) {
@@ -1024,67 +1098,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                         }
                     }
                 }
+                CFRelease(sampleBuffer);
             });
         }
     }
 }
 
 #pragma mark - Helper Methods
-
-- (CGAffineTransform)currentVideoTransform {
-    // Get the current device orientation
-    // Must be called on main thread to access UIDevice
-    __block UIDeviceOrientation deviceOrientation;
-    if ([NSThread isMainThread]) {
-        deviceOrientation = [UIDevice currentDevice].orientation;
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            deviceOrientation = [UIDevice currentDevice].orientation;
-        });
-    }
-
-    // Determine if we're using front camera (for mirroring consideration)
-    BOOL isFrontCamera = (self.videoInput.device.position == AVCaptureDevicePositionFront);
-
-    // Calculate the appropriate rotation based on device orientation
-    // The camera sensor is in landscape orientation, so we need to rotate for proper playback
-    CGAffineTransform transform;
-
-    switch (deviceOrientation) {
-        case UIDeviceOrientationPortrait:
-            // Phone held normally (home button at bottom)
-            transform = CGAffineTransformMakeRotation(-M_PI_2);  // 90° counter-clockwise
-            break;
-
-        case UIDeviceOrientationPortraitUpsideDown:
-            // Phone upside down (home button at top)
-            transform = CGAffineTransformMakeRotation(M_PI_2);  // 90° clockwise
-            break;
-
-        case UIDeviceOrientationLandscapeLeft:
-            // Phone rotated left (home button on right)
-            transform = CGAffineTransformIdentity;  // No rotation
-            break;
-
-        case UIDeviceOrientationLandscapeRight:
-            // Phone rotated right (home button on left)
-            transform = CGAffineTransformMakeRotation(M_PI);  // 180°
-            break;
-
-        case UIDeviceOrientationFaceUp:
-        case UIDeviceOrientationFaceDown:
-        case UIDeviceOrientationUnknown:
-        default:
-            // Default to portrait if orientation is unclear
-            transform = CGAffineTransformMakeRotation(-M_PI_2);
-            break;
-    }
-
-    NSLog(@"[HeyJoeCapturer] Video transform for orientation %ld (front camera: %d)",
-          (long)deviceOrientation, isFrontCamera);
-
-    return transform;
-}
 
 + (AVCaptureDeviceFormat *)bestFormatForDevice:(AVCaptureDevice *)device
                                targetFrameRate:(NSInteger)fps {
@@ -1270,6 +1290,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                                        CMSampleBufferRef sampleBuffer) {
     if (!outputCallbackRefCon) return;
     HeyJoeVideoCapturer *capturer = (__bridge HeyJoeVideoCapturer *)outputCallbackRefCon;
+
+    // Verify this callback is for the current shared instance.
+    // After a room transition, stale callbacks from a previous (deallocated)
+    // instance may still fire — ignore them to prevent EXC_BAD_ACCESS.
+    if (capturer != [HeyJoeVideoCapturer sharedInstance]) {
+        return;
+    }
+
     capturer.compressedCallbackCount++;
     if (capturer.compressedCallbackCount <= 3 || capturer.compressedCallbackCount % 30 == 0) {
         NSLog(@"[HeyJoeCapturer] Compression callback #%d, status=%d", capturer.compressedCallbackCount, (int)status);
