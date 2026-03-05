@@ -2,6 +2,7 @@
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrameBuffer.h>
 #import <UIKit/UIKit.h>
+#import <Accelerate/Accelerate.h>
 
 static HeyJoeVideoCapturer *_sharedInstance = nil;
 
@@ -32,6 +33,9 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 @property (nonatomic, strong, nullable) NSError *recordingSetupError;
 @property (nonatomic, assign) int encodedFrameCount;
 @property (nonatomic, assign) int audioFrameCount;
+@property (nonatomic) CVPixelBufferPoolRef scaleBufferPool;
+@property (nonatomic, assign) int writerTargetWidth;
+@property (nonatomic, assign) int writerTargetHeight;
 
 // Queues
 @property (nonatomic, strong) dispatch_queue_t captureQueue;
@@ -154,6 +158,10 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
             [self.assetWriter cancelWriting];
         }
         self.pixelBufferAdaptor = nil;
+        if (self.scaleBufferPool) {
+            CVPixelBufferPoolRelease(self.scaleBufferPool);
+            self.scaleBufferPool = NULL;
+        }
     };
     if (dispatch_get_specific(kRecordingQueueSpecificKey)) {
         recordingCleanup();
@@ -498,9 +506,8 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     NSLog(@"[HeyJoeCapturer] Video writer transform set for device orientation");
 
     // Create pixel buffer adaptor — only declare pixel format, not dimensions.
-    // Camera buffers are native resolution (e.g. 4K); the writer scales to
-    // AVVideoWidthKey/AVVideoHeightKey internally. Declaring mismatched dimensions
-    // here would mis-size the adaptor's pixel buffer pool.
+    // Callers scale pixel buffers to match output dimensions via vImage before
+    // appending, so the adaptor's pool doesn't need dimension constraints.
     NSDictionary *sourcePixelBufferAttributes = @{
         (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
     };
@@ -616,6 +623,10 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     self.recordingState = HJRecordingStateIdle;
 
     self.pixelBufferAdaptor = nil;
+    if (self.scaleBufferPool) {
+        CVPixelBufferPoolRelease(self.scaleBufferPool);
+        self.scaleBufferPool = NULL;
+    }
 
     // Cancel asset writer
     if (self.assetWriter) {
@@ -686,6 +697,10 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
         // Pre-recording cleanup: force-clean any stale resources
         self.pixelBufferAdaptor = nil;
+        if (self.scaleBufferPool) {
+            CVPixelBufferPoolRelease(self.scaleBufferPool);
+            self.scaleBufferPool = NULL;
+        }
         if (self.assetWriter) {
             NSLog(@"[HeyJoeCapturer] Cleaning up stale asset writer before new recording (status=%ld)",
                   (long)self.assetWriter.status);
@@ -902,8 +917,13 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     self.audioWriterInputAdded = NO;
     self.recordingStartTime = kCMTimeInvalid;
     self.recordingSetupError = nil;
+    self.encodedFrameCount = 0;
     self.audioFrameCount = 0;
     self.pixelBufferAdaptor = nil;
+    if (self.scaleBufferPool) {
+        CVPixelBufferPoolRelease(self.scaleBufferPool);
+        self.scaleBufferPool = NULL;
+    }
     self.assetWriter = nil;
     self.videoWriterInput = nil;
     self.audioWriterInput = nil;
@@ -980,6 +1000,83 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 }
 
+/// Must be called on recordingQueue. Returns a scaled pixel buffer from the pool, or NULL on failure.
+/// Caller must CVPixelBufferRelease the returned buffer.
+- (CVPixelBufferRef)_scaledPixelBufferFromBuffer:(CVPixelBufferRef)sourceBuffer
+                                           width:(int)targetWidth
+                                          height:(int)targetHeight {
+    // Create pool on first use (or if dimensions changed)
+    if (!self.scaleBufferPool) {
+        NSDictionary *poolAttrs = @{
+            (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            (NSString *)kCVPixelBufferWidthKey: @(targetWidth),
+            (NSString *)kCVPixelBufferHeightKey: @(targetHeight),
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        };
+        CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
+                                                   (__bridge CFDictionaryRef)poolAttrs,
+                                                   &_scaleBufferPool);
+        if (status != kCVReturnSuccess) {
+            NSLog(@"[HeyJoeCapturer] Failed to create scale buffer pool: %d", (int)status);
+            return NULL;
+        }
+        NSLog(@"[HeyJoeCapturer] Created scale buffer pool: %dx%d", targetWidth, targetHeight);
+    }
+
+    CVPixelBufferRef destBuffer = NULL;
+    CVReturn status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
+                                                          self.scaleBufferPool,
+                                                          &destBuffer);
+    if (status != kCVReturnSuccess || !destBuffer) {
+        NSLog(@"[HeyJoeCapturer] Failed to get buffer from scale pool: %d", (int)status);
+        return NULL;
+    }
+
+    CVPixelBufferLockBaseAddress(sourceBuffer, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(destBuffer, 0);
+
+    // Scale Y plane (plane 0)
+    vImage_Buffer srcY = {
+        .data = CVPixelBufferGetBaseAddressOfPlane(sourceBuffer, 0),
+        .height = CVPixelBufferGetHeightOfPlane(sourceBuffer, 0),
+        .width = CVPixelBufferGetWidthOfPlane(sourceBuffer, 0),
+        .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(sourceBuffer, 0)
+    };
+    vImage_Buffer dstY = {
+        .data = CVPixelBufferGetBaseAddressOfPlane(destBuffer, 0),
+        .height = CVPixelBufferGetHeightOfPlane(destBuffer, 0),
+        .width = CVPixelBufferGetWidthOfPlane(destBuffer, 0),
+        .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(destBuffer, 0)
+    };
+    vImage_Error yErr = vImageScale_Planar8(&srcY, &dstY, NULL, kvImageNoFlags);
+
+    // Scale CbCr plane (plane 1) — interleaved 2-byte pairs
+    vImage_Buffer srcCbCr = {
+        .data = CVPixelBufferGetBaseAddressOfPlane(sourceBuffer, 1),
+        .height = CVPixelBufferGetHeightOfPlane(sourceBuffer, 1),
+        .width = CVPixelBufferGetWidthOfPlane(sourceBuffer, 1),
+        .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(sourceBuffer, 1)
+    };
+    vImage_Buffer dstCbCr = {
+        .data = CVPixelBufferGetBaseAddressOfPlane(destBuffer, 1),
+        .height = CVPixelBufferGetHeightOfPlane(destBuffer, 1),
+        .width = CVPixelBufferGetWidthOfPlane(destBuffer, 1),
+        .rowBytes = CVPixelBufferGetBytesPerRowOfPlane(destBuffer, 1)
+    };
+    vImage_Error cErr = vImageScale_CbCr8(&srcCbCr, &dstCbCr, NULL, kvImageNoFlags);
+
+    CVPixelBufferUnlockBaseAddress(destBuffer, 0);
+    CVPixelBufferUnlockBaseAddress(sourceBuffer, kCVPixelBufferLock_ReadOnly);
+
+    if (yErr != kvImageNoError || cErr != kvImageNoError) {
+        NSLog(@"[HeyJoeCapturer] vImage scale failed Y=%ld CbCr=%ld — dropping buffer", yErr, cErr);
+        CVPixelBufferRelease(destBuffer);
+        return NULL;
+    }
+
+    return destBuffer; // caller must CVPixelBufferRelease
+}
+
 /// Must be called on recordingQueue. Appends a pixel buffer via AVAssetWriterInputPixelBufferAdaptor.
 - (void)_encodeVideoFrame:(CVPixelBufferRef)pixelBuffer timestamp:(CMTime)timestamp {
     // Check recording state
@@ -996,6 +1093,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         NSLog(@"[HeyJoeCapturer] First encode frame: pixelBuffer=%dx%d format=%.4s",
               actualWidth, actualHeight, (char *)&pixelFormat);
 
+        // Compute target dimensions and bitrate.
+        // For 1080p target, we downscale via vImage before appending.
         int targetWidth = actualWidth;
         int targetHeight = actualHeight;
         int bitrate = 20000000; // 20 Mbps for 4K
@@ -1011,9 +1110,13 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             bitrate = 8000000; // 8 Mbps for 1080p
         }
 
-        NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps HEVC (target: %s)",
+        NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps HEVC (source: %dx%d, target: %s)",
               targetWidth, targetHeight, bitrate / 1000000,
+              actualWidth, actualHeight,
               self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p");
+
+        self.writerTargetWidth = targetWidth;
+        self.writerTargetHeight = targetHeight;
 
         if (![self _setupAssetWriterWithWidth:targetWidth height:targetHeight bitrate:bitrate]) {
             NSLog(@"[HeyJoeCapturer] Failed to setup asset writer");
@@ -1046,7 +1149,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         NSLog(@"[HeyJoeCapturer] Recording state: Starting → Recording (recordingActive=YES)");
     }
 
-    // Append pixel buffer via adaptor
+    // Append pixel buffer via adaptor — scale down if needed for 1080p target
     if (self.assetWriter.status == AVAssetWriterStatusWriting) {
         self.encodedFrameCount++;
         if (self.encodedFrameCount <= 3) {
@@ -1057,8 +1160,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", self.encodedFrameCount);
         }
 
+        // Scale if source dimensions exceed writer output dimensions
+        CVPixelBufferRef bufferToAppend = pixelBuffer;
+        CVPixelBufferRef scaledBuffer = NULL;
+        int srcWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
+        int srcHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
+
+        if (srcWidth != self.writerTargetWidth || srcHeight != self.writerTargetHeight) {
+            scaledBuffer = [self _scaledPixelBufferFromBuffer:pixelBuffer
+                                                        width:self.writerTargetWidth
+                                                       height:self.writerTargetHeight];
+            if (scaledBuffer) {
+                bufferToAppend = scaledBuffer;
+            } else {
+                // Drop frame rather than appending wrong-sized buffer which
+                // would put the writer into AVAssetWriterStatusFailed.
+                return;
+            }
+        }
+
         if (self.videoWriterInput.readyForMoreMediaData) {
-            if ([self.pixelBufferAdaptor appendPixelBuffer:pixelBuffer withPresentationTime:timestamp]) {
+            if ([self.pixelBufferAdaptor appendPixelBuffer:bufferToAppend withPresentationTime:timestamp]) {
                 self.hasWrittenFirstVideoFrame = YES;
             } else {
                 NSError *appendErr = self.assetWriter.error;
@@ -1067,11 +1189,14 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                       appendErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
                 self.lastRecordingFailurePoint = @"videoAppend";
                 if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                    if (scaledBuffer) CVPixelBufferRelease(scaledBuffer);
                     [self _failRecordingWithError:appendErr];
                     return;
                 }
             }
         }
+
+        if (scaledBuffer) CVPixelBufferRelease(scaledBuffer);
     } else if (self.assetWriter.status == AVAssetWriterStatusFailed) {
         NSError *err = self.assetWriter.error;
         NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at writerFailed: domain=%@ code=%ld desc=%@ underlying=%@",
