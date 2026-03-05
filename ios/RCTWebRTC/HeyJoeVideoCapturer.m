@@ -543,13 +543,10 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         return NO;
     }
 
-    if ([self.assetWriter canAddInput:self.audioWriterInput]) {
-        [self.assetWriter addInput:self.audioWriterInput];
-        self.audioWriterInputAdded = YES;
-    } else {
-        NSLog(@"[HeyJoeCapturer] Cannot add audio writer input — continuing without audio");
-        self.audioWriterInputAdded = NO;
-    }
+    // DIAGNOSTIC: Skip audio to isolate whether -12780 is from video or audio encoder.
+    // If video-only recording works, the audio config (4ch→1ch downmix) is the problem.
+    self.audioWriterInputAdded = NO;
+    NSLog(@"[HeyJoeCapturer] DIAGNOSTIC: Audio input SKIPPED to isolate encoder error");
 
     NSLog(@"[HeyJoeCapturer] Asset writer created: video=added (H.264 %dx%d), audio=%s, URL=%@",
           width, height,
