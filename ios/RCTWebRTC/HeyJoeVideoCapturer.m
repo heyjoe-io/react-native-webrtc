@@ -475,7 +475,7 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     }
 
     self.assetWriter = [[AVAssetWriter alloc] initWithURL:self.recordingURL
-                                                 fileType:AVFileTypeMPEG4
+                                                 fileType:AVFileTypeQuickTimeMovie
                                                     error:&error];
     if (error) {
         NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at assetWriterCreate: domain=%@ code=%ld desc=%@ underlying=%@",
@@ -568,6 +568,21 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
     if (!self.hasWrittenFirstVideoFrame) {
         // Don't write audio before the first video frame
+        CFRelease(sampleBuffer);
+        return;
+    }
+
+    // Drop audio samples with PTS before the recording session start time.
+    // After room transitions, an audio sample captured just before the first
+    // video frame can have a PTS slightly earlier than startSessionAtSourceTime,
+    // which can cause the writer to fail.
+    CMTime audioPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (CMTIME_IS_VALID(self.recordingStartTime) &&
+        CMTimeCompare(audioPTS, self.recordingStartTime) < 0) {
+        if (self.audioFrameCount == 0) {
+            NSLog(@"[HeyJoeCapturer] Dropping audio sample with PTS %.3f < session start %.3f",
+                  CMTimeGetSeconds(audioPTS), CMTimeGetSeconds(self.recordingStartTime));
+        }
         CFRelease(sampleBuffer);
         return;
     }
@@ -1013,7 +1028,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
             (NSString *)kCVPixelBufferWidthKey: @(targetWidth),
             (NSString *)kCVPixelBufferHeightKey: @(targetHeight),
-            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            (NSString *)kCVPixelBufferMetalCompatibilityKey: @YES
         };
         CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
                                                    (__bridge CFDictionaryRef)poolAttrs,
@@ -1157,7 +1173,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         if (self.encodedFrameCount <= 3) {
             size_t w = CVPixelBufferGetWidth(pixelBuffer);
             size_t h = CVPixelBufferGetHeight(pixelBuffer);
-            NSLog(@"[HeyJoeCapturer] Frame #%d — PixelBuffer: %zux%zu", self.encodedFrameCount, w, h);
+            OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+            Boolean isSurface = CVPixelBufferGetIOSurface(pixelBuffer) != NULL;
+            NSLog(@"[HeyJoeCapturer] Frame #%d — PixelBuffer: %zux%zu format=%.4s ioSurface=%d writerStatus=%ld PTS=%.3f",
+                  self.encodedFrameCount, w, h, (char *)&fmt, isSurface,
+                  (long)self.assetWriter.status, CMTimeGetSeconds(timestamp));
         } else if (self.encodedFrameCount % 30 == 0) {
             NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", self.encodedFrameCount);
         }
@@ -1183,7 +1203,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         if (self.videoWriterInput.readyForMoreMediaData) {
             if ([self.pixelBufferAdaptor appendPixelBuffer:bufferToAppend withPresentationTime:timestamp]) {
-                self.hasWrittenFirstVideoFrame = YES;
+                if (!self.hasWrittenFirstVideoFrame) {
+                    self.hasWrittenFirstVideoFrame = YES;
+                    NSLog(@"[HeyJoeCapturer] First video frame appended OK — writerStatus=%ld PTS=%.3f",
+                          (long)self.assetWriter.status, CMTimeGetSeconds(timestamp));
+                }
             } else {
                 NSError *appendErr = self.assetWriter.error;
                 NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at videoAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
