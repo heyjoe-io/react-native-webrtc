@@ -517,16 +517,15 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoWriterInput
                                    sourcePixelBufferAttributes:sourcePixelBufferAttributes];
 
-    AudioChannelLayout acl;
-    memset(&acl, 0, sizeof(acl));
-    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
-
+    // Audio output settings — use 48kHz to match device sample rate.
+    // Do NOT specify AVChannelLayoutKey — the device may provide 4-channel audio
+    // (multi-mic array during WebRTC calls) and an explicit mono layout tag
+    // causes the AAC encoder to reject the 4→1 downmix.
     NSDictionary *audioSettings = @{
         AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @(44100),
+        AVSampleRateKey: @(48000),
         AVNumberOfChannelsKey: @(1),
-        AVEncoderBitRateKey: @(128000),
-        AVChannelLayoutKey: [NSData dataWithBytes:&acl length:sizeof(acl)]
+        AVEncoderBitRateKey: @(128000)
     };
 
     self.audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
