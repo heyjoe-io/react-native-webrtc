@@ -3,15 +3,8 @@
 #import <WebRTC/RTCVideoFrameBuffer.h>
 #import <UIKit/UIKit.h>
 #import <Accelerate/Accelerate.h>
-#import <stdatomic.h>
 
 static HeyJoeVideoCapturer *_sharedInstance = nil;
-
-// Class-level guard — prevents concurrent recording across multiple instances.
-// After room transitions, a new HeyJoeVideoCapturer is created while the old one
-// may still be alive. Both have separate recordingQueues, so instance-level guards
-// don't protect against double-recording.
-static atomic_bool _classRecordingActive = false;
 
 // Queue-specific keys for detecting current queue in dealloc
 static void *kCaptureQueueSpecificKey = &kCaptureQueueSpecificKey;
@@ -158,7 +151,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
     // Recording teardown — same pattern
     void (^recordingCleanup)(void) = ^{
-        atomic_store(&_classRecordingActive, false);
         self.recordingActive = NO;
         self.recordingStarting = NO;
         self.recordingState = HJRecordingStateIdle;
@@ -642,7 +634,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
           self.encodedFrameCount,
           self.hasWrittenFirstVideoFrame, self.audioWriterInputAdded);
 
-    atomic_store(&_classRecordingActive, false);
     self.recordingActive = NO;
     self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;
@@ -699,23 +690,9 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 - (void)startRecordingToURL:(NSURL *)outputURL
           completionHandler:(void (^)(NSError *))completionHandler {
 
-    // Class-level guard — atomic exchange prevents any concurrent recording,
-    // even across separate HeyJoeVideoCapturer instances with separate queues.
-    if (atomic_exchange(&_classRecordingActive, true)) {
-        NSLog(@"[HeyJoeCapturer] Recording blocked by class-level guard (another instance already recording)");
-        if (completionHandler) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler([NSError errorWithDomain:@"HeyJoeCapturer" code:4
-                    userInfo:@{NSLocalizedDescriptionKey: @"Another recording already in progress"}]);
-            });
-        }
-        return;
-    }
-
     dispatch_async(self.recordingQueue, ^{
         if (!self.isCapturing) {
             NSLog(@"[HeyJoeCapturer] Cannot start recording — not capturing");
-            atomic_store(&_classRecordingActive, false);
             if (completionHandler) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     completionHandler([NSError errorWithDomain:@"HeyJoeCapturer" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Not capturing"}]);
@@ -726,7 +703,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
         if (self.recordingState != HJRecordingStateIdle) {
             NSLog(@"[HeyJoeCapturer] Already recording (state=%ld)", (long)self.recordingState);
-            atomic_store(&_classRecordingActive, false);
             if (completionHandler) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     completionHandler([NSError errorWithDomain:@"HeyJoeCapturer" code:4 userInfo:@{NSLocalizedDescriptionKey: @"Already recording"}]);
@@ -950,7 +926,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
 /// Must be called on recordingQueue. Resets all recording state to idle.
 - (void)_cleanupRecordingState {
-    atomic_store(&_classRecordingActive, false);
     self.recordingActive = NO;
     self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;

@@ -57,17 +57,20 @@
             self.usingFrontCamera = position == AVCaptureDevicePositionFront;
         }
 
-        // Reuse existing HeyJoeVideoCapturer singleton if available.
-        // Creating a new instance per room join causes dangling pointer crashes
-        // when the old instance's compression callbacks are still in-flight.
-        HeyJoeVideoCapturer *existing = [HeyJoeVideoCapturer sharedInstance];
-        if (existing) {
-            [existing updateDelegate:capturer.delegate];
-            self.heyJoeCapturer = existing;
-            RCTLog(@"[VideoCaptureController] Reusing existing HeyJoeVideoCapturer instance");
-        } else {
-            self.heyJoeCapturer = [[HeyJoeVideoCapturer alloc] initWithDelegate:capturer.delegate];
-            RCTLog(@"[VideoCaptureController] Created new HeyJoeVideoCapturer instance");
+        // Thread-safe singleton — multiple getUserMedia calls during room join
+        // can race here. Without @synchronized, all of them see sharedInstance==nil
+        // and each creates a new HeyJoeVideoCapturer, causing 6+ instances that
+        // fight over the hardware encoder.
+        @synchronized([HeyJoeVideoCapturer class]) {
+            HeyJoeVideoCapturer *existing = [HeyJoeVideoCapturer sharedInstance];
+            if (existing) {
+                [existing updateDelegate:capturer.delegate];
+                self.heyJoeCapturer = existing;
+                RCTLog(@"[VideoCaptureController] Reusing existing HeyJoeVideoCapturer instance");
+            } else {
+                self.heyJoeCapturer = [[HeyJoeVideoCapturer alloc] initWithDelegate:capturer.delegate];
+                RCTLog(@"[VideoCaptureController] Created new HeyJoeVideoCapturer instance");
+            }
         }
     }
 
