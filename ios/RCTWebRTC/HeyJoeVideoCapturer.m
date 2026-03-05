@@ -463,7 +463,7 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 - (BOOL)_setupAssetWriterWithWidth:(int)width height:(int)height bitrate:(int)bitrate {
     // Must be called on recordingQueue
 
-    NSLog(@"[HeyJoeCapturer] _setupAssetWriterWithWidth: %dx%d @ %d Mbps HEVC, URL=%@",
+    NSLog(@"[HeyJoeCapturer] _setupAssetWriterWithWidth: %dx%d @ %d Mbps H.264, URL=%@",
           width, height, bitrate / 1000000, self.recordingURL.path);
 
     NSError *error = nil;
@@ -484,16 +484,18 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         return NO;
     }
 
-    // Explicit HEVC output settings — AVAssetWriter handles encoding internally
+    // H.264 output settings — more reliable than HEVC for repeated start/stop cycles.
+    // The hardware HEVC encoder can malfunction (-12780) after room transitions
+    // tear down and recreate the capture pipeline. H.264 is robust against this.
     NSDictionary *videoSettings = @{
-        AVVideoCodecKey: AVVideoCodecTypeHEVC,
+        AVVideoCodecKey: AVVideoCodecTypeH264,
         AVVideoWidthKey: @(width),
         AVVideoHeightKey: @(height),
         AVVideoCompressionPropertiesKey: @{
             AVVideoAverageBitRateKey: @(bitrate),
             AVVideoMaxKeyFrameIntervalKey: @(60),
             AVVideoExpectedSourceFrameRateKey: @(30),
-            AVVideoAllowFrameReorderingKey: @YES
+            AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
         }
     };
 
@@ -550,7 +552,7 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         self.audioWriterInputAdded = NO;
     }
 
-    NSLog(@"[HeyJoeCapturer] Asset writer created: video=added (HEVC %dx%d), audio=%s, URL=%@",
+    NSLog(@"[HeyJoeCapturer] Asset writer created: video=added (H.264 %dx%d), audio=%s, URL=%@",
           width, height,
           self.audioWriterInputAdded ? "added" : "NO",
           self.recordingURL.path);
@@ -1097,7 +1099,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         // For 1080p target, we downscale via vImage before appending.
         int targetWidth = actualWidth;
         int targetHeight = actualHeight;
-        int bitrate = 20000000; // 20 Mbps for 4K
+        int bitrate = 25000000; // 25 Mbps for 4K (H.264)
 
         if (self.recordingTargetResolution == HeyJoeRecordingResolution1080p) {
             if (actualWidth > actualHeight) {
@@ -1107,10 +1109,10 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 targetWidth = MIN(actualWidth, 1080);
                 targetHeight = MIN(actualHeight, 1920);
             }
-            bitrate = 8000000; // 8 Mbps for 1080p
+            bitrate = 10000000; // 10 Mbps for 1080p (H.264)
         }
 
-        NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps HEVC (source: %dx%d, target: %s)",
+        NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps H.264 (source: %dx%d, target: %s)",
               targetWidth, targetHeight, bitrate / 1000000,
               actualWidth, actualHeight,
               self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p");
