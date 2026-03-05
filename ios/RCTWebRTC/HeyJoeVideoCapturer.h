@@ -65,6 +65,16 @@ typedef NS_ENUM(NSInteger, HJRecordingState) {
 /// Current recording state (only read/written on recordingQueue)
 @property (nonatomic, assign, readonly) HJRecordingState recordingState;
 
+/// Atomic flag: YES when recording state is HJRecordingStateStarting.
+/// Complements recordingActive for safe cross-queue checks.
+@property (atomic, assign, readonly) BOOL recordingStarting;
+
+/// Tracks which code path triggered the last recording failure (for diagnostics)
+@property (nonatomic, strong, nullable) NSString *lastRecordingFailurePoint;
+
+/// Counts consecutive VTCompressionSessionEncodeFrame failures (for diagnostics)
+@property (nonatomic, assign) int consecutiveEncodeFailures;
+
 /// Shared instance for global access
 + (nullable instancetype)sharedInstance;
 + (void)setSharedInstance:(nullable HeyJoeVideoCapturer *)instance;

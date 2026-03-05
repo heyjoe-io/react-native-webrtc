@@ -46,6 +46,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 @property (nonatomic, strong, nullable) NSError *recordingSetupError;
 @property (nonatomic, assign) int encodedFrameCount;
 @property (nonatomic, assign) int compressedCallbackCount;
+@property (nonatomic, assign) int audioFrameCount;
 @property (nonatomic, strong, nullable) HJCompressionCallbackContext *callbackContext;
 
 // Queues
@@ -59,6 +60,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 @property (atomic, assign) BOOL isCapturing;
 @property (atomic, assign) int videoWidth;
 @property (atomic, assign) int videoHeight;
+@property (atomic, assign) BOOL recordingStarting;
 
 // Recording state (readwrite internally, only on recordingQueue)
 @property (nonatomic, assign) HJRecordingState recordingState;
@@ -103,6 +105,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
         _recordingState = HJRecordingStateIdle;
         _recordingActive = NO;
+        _recordingStarting = NO;
         _isCapturing = NO;
         _needsCompressionSetup = NO;
         _videoWidth = 1280;
@@ -112,6 +115,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _recordingTargetResolution = HeyJoeRecordingResolution1080p;
         _encodedFrameCount = 0;
         _compressedCallbackCount = 0;
+        _audioFrameCount = 0;
+        _consecutiveEncodeFailures = 0;
 
         // Cache device orientation — avoids dispatch_sync to main queue at 30fps
         _cachedDeviceOrientation = UIDeviceOrientationPortrait;
@@ -206,6 +211,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         NSLog(@"[HeyJoeCapturer] Stopping recording due to memory pressure");
         dispatch_async(self.recordingQueue, ^{
             if (self.recordingState == HJRecordingStateRecording) {
+                self.lastRecordingFailurePoint = @"memoryWarning";
                 [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:20
                     userInfo:@{NSLocalizedDescriptionKey: @"Recording stopped due to low memory"}]];
             }
@@ -393,6 +399,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)stopCaptureWithCompletionHandler:(void (^)(void))completionHandler {
+    NSLog(@"[HeyJoeCapturer] stopCaptureWithCompletionHandler: isCapturing=%d, recordingActive=%d, recordingStarting=%d",
+          self.isCapturing, self.recordingActive, self.recordingStarting);
     dispatch_async(self.captureQueue, ^{
         if (!self.isCapturing) {
             if (completionHandler) {
@@ -508,7 +516,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     );
 
     if (vtStatus != noErr) {
-        NSLog(@"[HeyJoeCapturer] Failed to create compression session: %d", (int)vtStatus);
+        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at compressionCreate: OSStatus=%d", (int)vtStatus);
+        self.lastRecordingFailurePoint = @"compressionCreate";
         // Release the CFBridgingRetain'd ref since VT didn't take ownership
         CFRelease(refCon);
         self.callbackContext = nil;
@@ -550,8 +559,15 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
     if (!formatDesc) {
         NSLog(@"[HeyJoeCapturer] Failed to get format description from sample buffer");
+        self.lastRecordingFailurePoint = @"assetWriterCreate";
         return NO;
     }
+
+    // Pipeline state logging
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(formatDesc);
+    FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDesc);
+    NSLog(@"[HeyJoeCapturer] _setupAssetWriterWithSampleBuffer: URL=%@, videoFormatHint=%dx%d codec=%.4s",
+          self.recordingURL.path, dims.width, dims.height, (char *)&codec);
 
     NSError *error = nil;
 
@@ -565,7 +581,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                                                  fileType:AVFileTypeMPEG4
                                                     error:&error];
     if (error) {
-        NSLog(@"[HeyJoeCapturer] Failed to create asset writer: %@", error);
+        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at assetWriterCreate: domain=%@ code=%ld desc=%@ underlying=%@",
+              error.domain, (long)error.code, error.localizedDescription, error.userInfo[NSUnderlyingErrorKey]);
+        self.lastRecordingFailurePoint = @"assetWriterCreate";
         return NO;
     }
 
@@ -597,8 +615,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     if ([self.assetWriter canAddInput:self.videoWriterInput]) {
         [self.assetWriter addInput:self.videoWriterInput];
     } else {
-        NSLog(@"[HeyJoeCapturer] Cannot add video writer input - canAddInput returned NO");
-        NSLog(@"[HeyJoeCapturer] Asset writer error: %@", self.assetWriter.error);
+        NSLog(@"[HeyJoeCapturer] Cannot add video writer input - canAddInput returned NO, error=%@", self.assetWriter.error);
+        self.lastRecordingFailurePoint = @"videoInputAdd";
         return NO;
     }
 
@@ -610,7 +628,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.audioWriterInputAdded = NO;
     }
 
-    NSLog(@"[HeyJoeCapturer] Asset writer created with format hint for: %@", self.recordingURL.path);
+    NSLog(@"[HeyJoeCapturer] Asset writer created: video=added, audio=%s, URL=%@",
+          self.audioWriterInputAdded ? "added" : "NO",
+          self.recordingURL.path);
     return YES;
 }
 
@@ -631,12 +651,24 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         return;
     }
 
+    // Log first compressed frame info
+    if (!self.assetWriter) {
+        CMFormatDescriptionRef compressedFmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+        if (compressedFmt) {
+            CMVideoDimensions compDims = CMVideoFormatDescriptionGetDimensions(compressedFmt);
+            FourCharCode compCodec = CMFormatDescriptionGetMediaSubType(compressedFmt);
+            NSLog(@"[HeyJoeCapturer] First compressed frame: %dx%d codec=%.4s",
+                  compDims.width, compDims.height, (char *)&compCodec);
+        }
+    }
+
     // Deferred asset writer setup on first compressed frame
     if (!self.assetWriter) {
         NSLog(@"[HeyJoeCapturer] Performing deferred asset writer setup...");
         if (![self _setupAssetWriterWithSampleBuffer:sampleBuffer]) {
             NSLog(@"[HeyJoeCapturer] Deferred asset writer setup failed — stopping recording");
             CFRelease(sampleBuffer);
+            if (!self.lastRecordingFailurePoint) self.lastRecordingFailurePoint = @"assetWriterCreate";
             [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:12
                 userInfo:@{NSLocalizedDescriptionKey: @"Asset writer setup failed"}]];
             return;
@@ -653,8 +685,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             NSLog(@"[HeyJoeCapturer] Asset writer started at time: %.3f", CMTimeGetSeconds(timestamp));
         } else {
             NSError *writerErr = self.assetWriter.error;
-            NSLog(@"[HeyJoeCapturer] CRITICAL: startWriting failed — status=%ld, error=%@, URL=%@",
-                  (long)self.assetWriter.status, writerErr, self.recordingURL);
+            NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at startWriting: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld, URL=%@",
+                  writerErr.domain, (long)writerErr.code, writerErr.localizedDescription,
+                  writerErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status, self.recordingURL);
+            self.lastRecordingFailurePoint = @"startWriting";
             CFRelease(sampleBuffer);
             [self _failRecordingWithError:writerErr ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:10
                 userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}]];
@@ -669,8 +703,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                 self.hasWrittenFirstVideoFrame = YES;
             } else {
                 NSError *appendErr = self.assetWriter.error;
-                NSLog(@"[HeyJoeCapturer] CRITICAL: Failed to append video sample — status=%ld, error=%@",
-                      (long)self.assetWriter.status, appendErr);
+                NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at videoAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
+                      appendErr.domain, (long)appendErr.code, appendErr.localizedDescription,
+                      appendErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
+                self.lastRecordingFailurePoint = @"videoAppend";
                 if (self.assetWriter.status == AVAssetWriterStatusFailed) {
                     CFRelease(sampleBuffer);
                     [self _failRecordingWithError:appendErr];
@@ -679,8 +715,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             }
         }
     } else if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-        NSLog(@"[HeyJoeCapturer] Asset writer in failed state: %@", self.assetWriter.error);
         NSError *err = self.assetWriter.error;
+        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at writerFailed: domain=%@ code=%ld desc=%@ underlying=%@",
+              err.domain, (long)err.code, err.localizedDescription, err.userInfo[NSUnderlyingErrorKey]);
+        self.lastRecordingFailurePoint = @"writerFailed";
         CFRelease(sampleBuffer);
         [self _failRecordingWithError:err];
         return;
@@ -704,10 +742,24 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     if (self.assetWriter.status == AVAssetWriterStatusWriting &&
         self.audioWriterInput.readyForMoreMediaData) {
+        // Log first audio frame format (encodedFrameCount resets per recording)
+        if (self.audioFrameCount == 0) {
+            CMFormatDescriptionRef audioFmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+            if (audioFmt) {
+                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(audioFmt);
+                if (asbd) {
+                    NSLog(@"[HeyJoeCapturer] First audio frame: sampleRate=%.0f, channels=%u, formatID=%.4s",
+                          asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame, (char *)&asbd->mFormatID);
+                }
+            }
+        }
+        self.audioFrameCount++;
         if (![self.audioWriterInput appendSampleBuffer:sampleBuffer]) {
             NSError *audioErr = self.assetWriter.error;
-            NSLog(@"[HeyJoeCapturer] Failed to append audio sample — status=%ld, error=%@",
-                  (long)self.assetWriter.status, audioErr);
+            NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at audioAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
+                  audioErr.domain, (long)audioErr.code, audioErr.localizedDescription,
+                  audioErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
+            self.lastRecordingFailurePoint = @"audioAppend";
             if (self.assetWriter.status == AVAssetWriterStatusFailed) {
                 CFRelease(sampleBuffer);
                 [self _failRecordingWithError:audioErr];
@@ -722,9 +774,24 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 /// Central error handler — must be called on recordingQueue.
 /// All error paths funnel through here.
 - (void)_failRecordingWithError:(NSError *)error {
-    NSLog(@"[HeyJoeCapturer] _failRecordingWithError: %@", error);
+    // Rich error logging
+    NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at %@: domain=%@ code=%ld desc=%@ underlying=%@",
+          self.lastRecordingFailurePoint ?: @"unknown",
+          error.domain, (long)error.code, error.localizedDescription,
+          error.userInfo[NSUnderlyingErrorKey]);
+
+    // State dump at failure
+    NSLog(@"[HeyJoeCapturer] State at failure: recordingState=%ld, isCapturing=%d, "
+          "writerStatus=%ld, compressionSession=%@, encodedFrames=%d, compressedCallbacks=%d, "
+          "hasFirstVideoFrame=%d, audioAdded=%d",
+          (long)self.recordingState, self.isCapturing,
+          (long)(self.assetWriter ? self.assetWriter.status : -1),
+          self.compressionSession ? @"exists" : @"nil",
+          self.encodedFrameCount, self.compressedCallbackCount,
+          self.hasWrittenFirstVideoFrame, self.audioWriterInputAdded);
 
     self.recordingActive = NO;
+    self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;
 
     // Invalidate callback context to stop any in-flight VT callbacks
@@ -765,12 +832,23 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         });
     }
 
+    // Build rich error info for JS
+    NSMutableDictionary *errorInfo = [NSMutableDictionary dictionary];
+    errorInfo[@"error"] = error.localizedDescription ?: @"Unknown error";
+    errorInfo[@"domain"] = error.domain ?: @"unknown";
+    errorInfo[@"code"] = @(error.code);
+    if (error.userInfo[NSUnderlyingErrorKey]) {
+        NSError *underlying = error.userInfo[NSUnderlyingErrorKey];
+        errorInfo[@"underlyingError"] = [NSString stringWithFormat:@"%@ code=%ld", underlying.domain, (long)underlying.code];
+    }
+    errorInfo[@"failurePoint"] = self.lastRecordingFailurePoint ?: @"unknown";
+
     // Notify JS
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter]
             postNotificationName:@"HeyJoeRecordingFailedMidStream"
             object:nil
-            userInfo:error ? @{@"error": error.localizedDescription ?: @"Unknown error"} : nil];
+            userInfo:errorInfo];
     });
 }
 
@@ -832,15 +910,24 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.recordingSetupError = nil;
         self.encodedFrameCount = 0;
         self.compressedCallbackCount = 0;
+        self.audioFrameCount = 0;
+        self.consecutiveEncodeFailures = 0;
+        self.lastRecordingFailurePoint = nil;
         self.needsCompressionSetup = YES;
         self.recordingCompletionHandler = nil;
 
         // Transition: Idle → Starting
         self.recordingState = HJRecordingStateStarting;
+        self.recordingStarting = YES;
         // recordingActive stays NO until we actually transition to Recording
         // (after compression session is set up on first frame dispatch)
 
-        NSLog(@"[HeyJoeCapturer] Recording started (target: %s) to: %@ (compression setup deferred)",
+        NSLog(@"[HeyJoeCapturer] startRecordingToURL: isCapturing=%d, recordingState=%ld, "
+              "existingWriter=%@(status=%ld), existingCompression=%@, target=%s, URL=%@",
+              self.isCapturing, (long)self.recordingState,
+              self.assetWriter ? @"YES" : @"NO",
+              (long)(self.assetWriter ? self.assetWriter.status : -1),
+              self.compressionSession ? @"YES" : @"NO",
               self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p",
               outputURL.path);
 
@@ -887,6 +974,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     if (self.recordingState == HJRecordingStateStarting) {
         NSLog(@"[HeyJoeCapturer] Recording stopped before any frames were processed");
         self.recordingActive = NO;
+        self.recordingStarting = NO;
         self.recordingState = HJRecordingStateIdle;
         self.callbackContext.invalidated = YES;
         self.callbackContext = nil;
@@ -896,6 +984,21 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             dispatch_async(dispatch_get_main_queue(), ^{
                 completionHandler(nil, nil);
             });
+        }
+        return;
+    }
+
+    // Double-stop guard: if stop is already in progress, chain the completion handler
+    if (self.recordingState == HJRecordingStateDraining ||
+        self.recordingState == HJRecordingStateFinalizing) {
+        NSLog(@"[HeyJoeCapturer] Stop already in progress (state=%ld), chaining completion",
+              (long)self.recordingState);
+        if (completionHandler) {
+            void (^existing)(NSURL *, NSError *) = self.recordingCompletionHandler;
+            self.recordingCompletionHandler = ^(NSURL *url, NSError *err) {
+                if (existing) existing(url, err);
+                dispatch_async(dispatch_get_main_queue(), ^{ completionHandler(url, err); });
+            };
         }
         return;
     }
@@ -1037,12 +1140,15 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 /// Must be called on recordingQueue. Resets all recording state to idle.
 - (void)_cleanupRecordingState {
     self.recordingActive = NO;
+    self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;
     self.needsCompressionSetup = NO;
     self.hasWrittenFirstVideoFrame = NO;
     self.audioWriterInputAdded = NO;
     self.recordingStartTime = kCMTimeInvalid;
     self.recordingSetupError = nil;
+    self.consecutiveEncodeFailures = 0;
+    self.audioFrameCount = 0;
     self.assetWriter = nil;
     self.videoWriterInput = nil;
     self.audioWriterInput = nil;
@@ -1097,7 +1203,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         [self.delegate capturer:self didCaptureVideoFrame:videoFrame];
 
         // === Recording: dispatch to recordingQueue if active ===
-        if (self.recordingActive || self.recordingState == HJRecordingStateStarting) {
+        // Both recordingActive and recordingStarting are atomic — safe to read from videoOutputQueue
+        if (self.recordingActive || self.recordingStarting) {
             // Retain pixel buffer for async dispatch to recordingQueue
             CVPixelBufferRetain(pixelBuffer);
             CMTime ts = timestamp; // value copy
@@ -1130,7 +1237,9 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     if (self.needsCompressionSetup && !self.compressionSession) {
         int actualWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
         int actualHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
-        NSLog(@"[HeyJoeCapturer] Actual pixel buffer dimensions: %dx%d", actualWidth, actualHeight);
+        OSType pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
+        NSLog(@"[HeyJoeCapturer] First encode frame: pixelBuffer=%dx%d format=%.4s",
+              actualWidth, actualHeight, (char *)&pixelFormat);
 
         int targetWidth = actualWidth;
         int targetHeight = actualHeight;
@@ -1153,6 +1262,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
         if (![self _setupCompressionSessionWithWidth:targetWidth height:targetHeight bitrate:bitrate]) {
             NSLog(@"[HeyJoeCapturer] Failed to setup compression session");
+            self.lastRecordingFailurePoint = @"compressionSetup";
             [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:5
                 userInfo:@{NSLocalizedDescriptionKey: @"Compression session creation failed"}]];
             return;
@@ -1162,6 +1272,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         // Transition: Starting → Recording
         self.recordingState = HJRecordingStateRecording;
         self.recordingActive = YES;
+        self.recordingStarting = NO;
         NSLog(@"[HeyJoeCapturer] Recording state: Starting → Recording (recordingActive=YES)");
     }
 
@@ -1185,7 +1296,17 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             NULL
         );
         if (status != noErr) {
-            NSLog(@"[HeyJoeCapturer] VTCompressionSessionEncodeFrame failed with status: %d", (int)status);
+            self.consecutiveEncodeFailures++;
+            NSLog(@"[HeyJoeCapturer] Encode failed: OSStatus %d (consecutive: %d)", (int)status, self.consecutiveEncodeFailures);
+            if (self.consecutiveEncodeFailures >= 10) {
+                self.lastRecordingFailurePoint = @"encodeFailed";
+                [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:15
+                    userInfo:@{NSLocalizedDescriptionKey:
+                        [NSString stringWithFormat:@"Encoder failed %d consecutive frames (OSStatus %d)",
+                            self.consecutiveEncodeFailures, (int)status]}]];
+            }
+        } else {
+            self.consecutiveEncodeFailures = 0;
         }
     }
 }
