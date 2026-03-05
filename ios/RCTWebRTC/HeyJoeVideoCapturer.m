@@ -1,7 +1,6 @@
 #import "HeyJoeVideoCapturer.h"
 #import <WebRTC/RTCCVPixelBuffer.h>
 #import <WebRTC/RTCVideoFrameBuffer.h>
-#import <VideoToolbox/VideoToolbox.h>
 #import <UIKit/UIKit.h>
 
 static HeyJoeVideoCapturer *_sharedInstance = nil;
@@ -9,18 +8,6 @@ static HeyJoeVideoCapturer *_sharedInstance = nil;
 // Queue-specific keys for detecting current queue in dealloc
 static void *kCaptureQueueSpecificKey = &kCaptureQueueSpecificKey;
 static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
-
-// Forward declaration for compression callback
-static void compressionOutputCallback(void *outputCallbackRefCon,
-                                       void *sourceFrameRefCon,
-                                       OSStatus status,
-                                       VTEncodeInfoFlags infoFlags,
-                                       CMSampleBufferRef sampleBuffer);
-
-#pragma mark - HJCompressionCallbackContext
-
-@implementation HJCompressionCallbackContext
-@end
 
 #pragma mark - HeyJoeVideoCapturer Private Interface
 
@@ -37,17 +24,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 @property (nonatomic, strong) AVAssetWriter *assetWriter;
 @property (nonatomic, strong) AVAssetWriterInput *videoWriterInput;
 @property (nonatomic, strong) AVAssetWriterInput *audioWriterInput;
-@property (nonatomic) VTCompressionSessionRef compressionSession;
+@property (nonatomic, strong) AVAssetWriterInputPixelBufferAdaptor *pixelBufferAdaptor;
 @property (nonatomic, strong) NSURL *recordingURL;
 @property (nonatomic, assign) BOOL hasWrittenFirstVideoFrame;
 @property (nonatomic, assign) CMTime recordingStartTime;
-@property (nonatomic, assign) BOOL needsCompressionSetup;
 @property (nonatomic, assign) BOOL audioWriterInputAdded;
 @property (nonatomic, strong, nullable) NSError *recordingSetupError;
 @property (nonatomic, assign) int encodedFrameCount;
-@property (nonatomic, assign) int compressedCallbackCount;
 @property (nonatomic, assign) int audioFrameCount;
-@property (nonatomic, strong, nullable) HJCompressionCallbackContext *callbackContext;
 
 // Queues
 @property (nonatomic, strong) dispatch_queue_t captureQueue;
@@ -72,8 +56,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 // Completion handler for pending stop recording
 @property (nonatomic, copy, nullable) void (^recordingCompletionHandler)(NSURL * _Nullable, NSError * _Nullable);
 
-// Cached device orientation — updated via notification instead of per-frame dispatch_sync
-@property (nonatomic, assign) UIDeviceOrientation cachedDeviceOrientation;
+// Cached device orientation — updated via notification instead of per-frame dispatch_sync.
+// Atomic because it's written on main queue but read on recordingQueue.
+@property (atomic, assign) UIDeviceOrientation cachedDeviceOrientation;
 
 @end
 
@@ -107,16 +92,13 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         _recordingActive = NO;
         _recordingStarting = NO;
         _isCapturing = NO;
-        _needsCompressionSetup = NO;
         _videoWidth = 1280;
         _videoHeight = 720;
         _hasWrittenFirstVideoFrame = NO;
         _recordingStartTime = kCMTimeInvalid;
         _recordingTargetResolution = HeyJoeRecordingResolution1080p;
         _encodedFrameCount = 0;
-        _compressedCallbackCount = 0;
         _audioFrameCount = 0;
-        _consecutiveEncodeFailures = 0;
 
         // Cache device orientation — avoids dispatch_sync to main queue at 30fps
         _cachedDeviceOrientation = UIDeviceOrientationPortrait;
@@ -150,9 +132,6 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 }
 
 - (void)dealloc {
-    // Invalidate callback context immediately to stop VT callbacks from reaching us
-    self.callbackContext.invalidated = YES;
-
     // Capture session teardown — use queue-specific key to avoid deadlock if last
     // retain was released from within captureQueue itself
     void (^captureCleanup)(void) = ^{
@@ -169,20 +148,12 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     // Recording teardown — same pattern
     void (^recordingCleanup)(void) = ^{
         self.recordingActive = NO;
+        self.recordingStarting = NO;
         self.recordingState = HJRecordingStateIdle;
-        if (self.compressionSession) {
-            VTCompressionSessionInvalidate(self.compressionSession);
-            CFRelease(self.compressionSession);
-            self.compressionSession = NULL;
-            // Release the CFBridgingRetain'd context ref
-            if (self.callbackContext) {
-                CFRelease((__bridge CFTypeRef)self.callbackContext);
-                self.callbackContext = nil;
-            }
-        }
         if (self.assetWriter) {
             [self.assetWriter cancelWriting];
         }
+        self.pixelBufferAdaptor = nil;
     };
     if (dispatch_get_specific(kRecordingQueueSpecificKey)) {
         recordingCleanup();
@@ -481,93 +452,11 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
 #pragma mark - Recording Control
 
-- (BOOL)_setupCompressionSessionWithWidth:(int)width height:(int)height bitrate:(int)bitrate {
+- (BOOL)_setupAssetWriterWithWidth:(int)width height:(int)height bitrate:(int)bitrate {
     // Must be called on recordingQueue
 
-    if (@available(iOS 11.0, *)) {
-        // iOS 11+ — use HEVC
-    } else {
-        NSLog(@"[HeyJoeCapturer] HEVC encoding requires iOS 11.0 or later");
-        return NO;
-    }
-
-    // Create callback context with ref-counted safety
-    HJCompressionCallbackContext *ctx = [[HJCompressionCallbackContext alloc] init];
-    ctx.capturer = self;  // weak
-    ctx.recordingQueue = self.recordingQueue;
-    ctx.invalidated = NO;
-    self.callbackContext = ctx;
-
-    // CFBridgingRetain: gives VT a +1 strong reference to the context object.
-    // This ensures the context stays alive even if self.callbackContext is nilled.
-    // We balance this with CFRelease when invalidating the compression session.
-    void *refCon = (void *)CFBridgingRetain(ctx);
-    OSStatus vtStatus = VTCompressionSessionCreate(
-        kCFAllocatorDefault,
-        width,
-        height,
-        kCMVideoCodecType_HEVC,
-        NULL,
-        NULL,
-        NULL,
-        compressionOutputCallback,
-        refCon,
-        &_compressionSession
-    );
-
-    if (vtStatus != noErr) {
-        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at compressionCreate: OSStatus=%d", (int)vtStatus);
-        self.lastRecordingFailurePoint = @"compressionCreate";
-        // Release the CFBridgingRetain'd ref since VT didn't take ownership
-        CFRelease(refCon);
-        self.callbackContext = nil;
-        return NO;
-    }
-
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_AverageBitRate,
-                         (__bridge CFNumberRef)@(bitrate));
-
-    NSArray *dataRateLimits = @[@(bitrate * 1.5), @1.0];
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_DataRateLimits,
-                         (__bridge CFArrayRef)dataRateLimits);
-
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_ExpectedFrameRate,
-                         (__bridge CFNumberRef)@(30));
-
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                         (__bridge CFNumberRef)@(60));
-
-    if (@available(iOS 11.0, *)) {
-        VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_ProfileLevel,
-                             kVTProfileLevel_HEVC_Main_AutoLevel);
-    }
-
-    VTSessionSetProperty(_compressionSession, kVTCompressionPropertyKey_AllowFrameReordering,
-                         kCFBooleanTrue);
-
-    VTCompressionSessionPrepareToEncodeFrames(_compressionSession);
-
-    NSLog(@"[HeyJoeCapturer] Compression session created: %dx%d @ %d Mbps H.265", width, height, bitrate / 1000000);
-    return YES;
-}
-
-- (BOOL)_setupAssetWriterWithSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    // Must be called on recordingQueue
-
-    CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-    if (!formatDesc) {
-        NSLog(@"[HeyJoeCapturer] Failed to get format description from sample buffer");
-        self.lastRecordingFailurePoint = @"assetWriterCreate";
-        return NO;
-    }
-
-    // Pipeline state logging
-    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(formatDesc);
-    FourCharCode codec = CMFormatDescriptionGetMediaSubType(formatDesc);
-    NSLog(@"[HeyJoeCapturer] _setupAssetWriterWithSampleBuffer: URL=%@, videoFormatHint=%dx%d codec=%.4s",
-          self.recordingURL.path, dims.width, dims.height, (char *)&codec);
+    NSLog(@"[HeyJoeCapturer] _setupAssetWriterWithWidth: %dx%d @ %d Mbps HEVC, URL=%@",
+          width, height, bitrate / 1000000, self.recordingURL.path);
 
     NSError *error = nil;
 
@@ -587,14 +476,38 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         return NO;
     }
 
+    // Explicit HEVC output settings — AVAssetWriter handles encoding internally
+    NSDictionary *videoSettings = @{
+        AVVideoCodecKey: AVVideoCodecTypeHEVC,
+        AVVideoWidthKey: @(width),
+        AVVideoHeightKey: @(height),
+        AVVideoCompressionPropertiesKey: @{
+            AVVideoAverageBitRateKey: @(bitrate),
+            AVVideoMaxKeyFrameIntervalKey: @(60),
+            AVVideoProfileLevelKey: AVVideoProfileLevelHEVC_Main_AutoLevel,
+            AVVideoExpectedSourceFrameRateKey: @(30),
+            AVVideoAllowFrameReorderingKey: @YES
+        }
+    };
+
     self.videoWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                                               outputSettings:nil
-                                                             sourceFormatHint:formatDesc];
+                                                              outputSettings:videoSettings];
     self.videoWriterInput.expectsMediaDataInRealTime = YES;
 
     CGAffineTransform videoTransform = [self videoTransformForCurrentDeviceOrientation];
     self.videoWriterInput.transform = videoTransform;
     NSLog(@"[HeyJoeCapturer] Video writer transform set for device orientation");
+
+    // Create pixel buffer adaptor — only declare pixel format, not dimensions.
+    // Camera buffers are native resolution (e.g. 4K); the writer scales to
+    // AVVideoWidthKey/AVVideoHeightKey internally. Declaring mismatched dimensions
+    // here would mis-size the adaptor's pixel buffer pool.
+    NSDictionary *sourcePixelBufferAttributes = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    };
+    self.pixelBufferAdaptor = [AVAssetWriterInputPixelBufferAdaptor
+        assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoWriterInput
+                                   sourcePixelBufferAttributes:sourcePixelBufferAttributes];
 
     AudioChannelLayout acl;
     memset(&acl, 0, sizeof(acl));
@@ -617,6 +530,9 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     } else {
         NSLog(@"[HeyJoeCapturer] Cannot add video writer input - canAddInput returned NO, error=%@", self.assetWriter.error);
         self.lastRecordingFailurePoint = @"videoInputAdd";
+        [self.assetWriter cancelWriting];
+        self.assetWriter = nil;
+        self.pixelBufferAdaptor = nil;
         return NO;
     }
 
@@ -628,103 +544,11 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.audioWriterInputAdded = NO;
     }
 
-    NSLog(@"[HeyJoeCapturer] Asset writer created: video=added, audio=%s, URL=%@",
+    NSLog(@"[HeyJoeCapturer] Asset writer created: video=added (HEVC %dx%d), audio=%s, URL=%@",
+          width, height,
           self.audioWriterInputAdded ? "added" : "NO",
           self.recordingURL.path);
     return YES;
-}
-
-/// Must be called on recordingQueue. Handles a compressed frame from VT callback.
-- (void)_handleCompressedFrame:(CMSampleBufferRef)sampleBuffer {
-    // Only append frames in Recording state.
-    // Draining/Finalizing/Idle frames are silently dropped — they arrive after
-    // markAsFinished has been called, so appending would crash the writer.
-    if (self.recordingState != HJRecordingStateRecording) {
-        CFRelease(sampleBuffer);
-        return;
-    }
-
-    // Guard against stale callbacks
-    if (!self.compressionSession) {
-        NSLog(@"[HeyJoeCapturer] Ignoring compressed frame — no active compression session");
-        CFRelease(sampleBuffer);
-        return;
-    }
-
-    // Log first compressed frame info
-    if (!self.assetWriter) {
-        CMFormatDescriptionRef compressedFmt = CMSampleBufferGetFormatDescription(sampleBuffer);
-        if (compressedFmt) {
-            CMVideoDimensions compDims = CMVideoFormatDescriptionGetDimensions(compressedFmt);
-            FourCharCode compCodec = CMFormatDescriptionGetMediaSubType(compressedFmt);
-            NSLog(@"[HeyJoeCapturer] First compressed frame: %dx%d codec=%.4s",
-                  compDims.width, compDims.height, (char *)&compCodec);
-        }
-    }
-
-    // Deferred asset writer setup on first compressed frame
-    if (!self.assetWriter) {
-        NSLog(@"[HeyJoeCapturer] Performing deferred asset writer setup...");
-        if (![self _setupAssetWriterWithSampleBuffer:sampleBuffer]) {
-            NSLog(@"[HeyJoeCapturer] Deferred asset writer setup failed — stopping recording");
-            CFRelease(sampleBuffer);
-            if (!self.lastRecordingFailurePoint) self.lastRecordingFailurePoint = @"assetWriterCreate";
-            [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:12
-                userInfo:@{NSLocalizedDescriptionKey: @"Asset writer setup failed"}]];
-            return;
-        }
-        NSLog(@"[HeyJoeCapturer] Deferred asset writer setup completed successfully");
-    }
-
-    // Start writing if not yet started
-    if (self.assetWriter.status == AVAssetWriterStatusUnknown) {
-        CMTime timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-        if ([self.assetWriter startWriting]) {
-            [self.assetWriter startSessionAtSourceTime:timestamp];
-            self.recordingStartTime = timestamp;
-            NSLog(@"[HeyJoeCapturer] Asset writer started at time: %.3f", CMTimeGetSeconds(timestamp));
-        } else {
-            NSError *writerErr = self.assetWriter.error;
-            NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at startWriting: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld, URL=%@",
-                  writerErr.domain, (long)writerErr.code, writerErr.localizedDescription,
-                  writerErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status, self.recordingURL);
-            self.lastRecordingFailurePoint = @"startWriting";
-            CFRelease(sampleBuffer);
-            [self _failRecordingWithError:writerErr ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:10
-                userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}]];
-            return;
-        }
-    }
-
-    // Append video frame
-    if (self.assetWriter.status == AVAssetWriterStatusWriting) {
-        if (self.videoWriterInput.readyForMoreMediaData) {
-            if ([self.videoWriterInput appendSampleBuffer:sampleBuffer]) {
-                self.hasWrittenFirstVideoFrame = YES;
-            } else {
-                NSError *appendErr = self.assetWriter.error;
-                NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at videoAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
-                      appendErr.domain, (long)appendErr.code, appendErr.localizedDescription,
-                      appendErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
-                self.lastRecordingFailurePoint = @"videoAppend";
-                if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-                    CFRelease(sampleBuffer);
-                    [self _failRecordingWithError:appendErr];
-                    return;
-                }
-            }
-        }
-    } else if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-        NSError *err = self.assetWriter.error;
-        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at writerFailed: domain=%@ code=%ld desc=%@ underlying=%@",
-              err.domain, (long)err.code, err.localizedDescription, err.userInfo[NSUnderlyingErrorKey]);
-        self.lastRecordingFailurePoint = @"writerFailed";
-        CFRelease(sampleBuffer);
-        [self _failRecordingWithError:err];
-        return;
-    }
-
-    CFRelease(sampleBuffer);
 }
 
 /// Must be called on recordingQueue. Handles audio sample from audioOutputQueue.
@@ -782,31 +606,17 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     // State dump at failure
     NSLog(@"[HeyJoeCapturer] State at failure: recordingState=%ld, isCapturing=%d, "
-          "writerStatus=%ld, compressionSession=%@, encodedFrames=%d, compressedCallbacks=%d, "
-          "hasFirstVideoFrame=%d, audioAdded=%d",
+          "writerStatus=%ld, encodedFrames=%d, hasFirstVideoFrame=%d, audioAdded=%d",
           (long)self.recordingState, self.isCapturing,
           (long)(self.assetWriter ? self.assetWriter.status : -1),
-          self.compressionSession ? @"exists" : @"nil",
-          self.encodedFrameCount, self.compressedCallbackCount,
+          self.encodedFrameCount,
           self.hasWrittenFirstVideoFrame, self.audioWriterInputAdded);
 
     self.recordingActive = NO;
     self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;
 
-    // Invalidate callback context to stop any in-flight VT callbacks
-    self.callbackContext.invalidated = YES;
-
-    // Tear down compression session + release the CFBridgingRetain'd context ref
-    if (self.compressionSession) {
-        VTCompressionSessionInvalidate(self.compressionSession);
-        CFRelease(self.compressionSession);
-        self.compressionSession = NULL;
-    }
-    if (self.callbackContext) {
-        CFRelease((__bridge CFTypeRef)self.callbackContext);
-        self.callbackContext = nil;
-    }
+    self.pixelBufferAdaptor = nil;
 
     // Cancel asset writer
     if (self.assetWriter) {
@@ -818,7 +628,6 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     self.videoWriterInput = nil;
     self.audioWriterInput = nil;
     self.recordingURL = nil;
-    self.needsCompressionSetup = NO;
     self.hasWrittenFirstVideoFrame = NO;
     self.recordingStartTime = kCMTimeInvalid;
     self.recordingSetupError = nil;
@@ -877,18 +686,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         }
 
         // Pre-recording cleanup: force-clean any stale resources
-        if (self.compressionSession) {
-            NSLog(@"[HeyJoeCapturer] Cleaning up stale compression session before new recording");
-            self.callbackContext.invalidated = YES;
-            VTCompressionSessionInvalidate(self.compressionSession);
-            CFRelease(self.compressionSession);
-            self.compressionSession = NULL;
-            // Release the CFBridgingRetain'd context ref
-            if (self.callbackContext) {
-                CFRelease((__bridge CFTypeRef)self.callbackContext);
-                self.callbackContext = nil;
-            }
-        }
+        self.pixelBufferAdaptor = nil;
         if (self.assetWriter) {
             NSLog(@"[HeyJoeCapturer] Cleaning up stale asset writer before new recording (status=%ld)",
                   (long)self.assetWriter.status);
@@ -909,11 +707,8 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         self.recordingStartTime = kCMTimeInvalid;
         self.recordingSetupError = nil;
         self.encodedFrameCount = 0;
-        self.compressedCallbackCount = 0;
         self.audioFrameCount = 0;
-        self.consecutiveEncodeFailures = 0;
         self.lastRecordingFailurePoint = nil;
-        self.needsCompressionSetup = YES;
         self.recordingCompletionHandler = nil;
 
         // Transition: Idle → Starting
@@ -923,11 +718,10 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         // (after compression session is set up on first frame dispatch)
 
         NSLog(@"[HeyJoeCapturer] startRecordingToURL: isCapturing=%d, recordingState=%ld, "
-              "existingWriter=%@(status=%ld), existingCompression=%@, target=%s, URL=%@",
+              "existingWriter=%@(status=%ld), target=%s, URL=%@",
               self.isCapturing, (long)self.recordingState,
               self.assetWriter ? @"YES" : @"NO",
               (long)(self.assetWriter ? self.assetWriter.status : -1),
-              self.compressionSession ? @"YES" : @"NO",
               self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p",
               outputURL.path);
 
@@ -973,13 +767,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     // Handle case where we're still in Starting state (no frames processed yet)
     if (self.recordingState == HJRecordingStateStarting) {
         NSLog(@"[HeyJoeCapturer] Recording stopped before any frames were processed");
-        self.recordingActive = NO;
-        self.recordingStarting = NO;
-        self.recordingState = HJRecordingStateIdle;
-        self.callbackContext.invalidated = YES;
-        self.callbackContext = nil;
-        self.needsCompressionSetup = NO;
-        self.recordingURL = nil;
+        [self _cleanupRecordingState];
         if (completionHandler) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 completionHandler(nil, nil);
@@ -1005,49 +793,18 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 
     NSURL *outputURL = self.recordingURL;
 
-    NSLog(@"[HeyJoeCapturer] Stopping recording — state: %ld, assetWriter=%@, compressionSession=%@",
+    NSLog(@"[HeyJoeCapturer] Stopping recording — state: %ld, assetWriter=%@",
           (long)self.recordingState,
-          self.assetWriter ? @"exists" : @"nil",
-          self.compressionSession ? @"exists" : @"nil");
+          self.assetWriter ? @"exists" : @"nil");
 
     // Step 1: Stop accepting new frames
+    // Do NOT nil pixelBufferAdaptor here — its pixel buffer pool must stay alive
+    // until finishWritingWithCompletionHandler: completes. _cleanupRecordingState handles it.
     self.recordingActive = NO;
     self.recordingState = HJRecordingStateDraining;
     NSLog(@"[HeyJoeCapturer] recordingActive=NO, state=Draining — no more frames will be dispatched");
 
-    // Step 2: Flush compression session on global queue with timeout
-    if (self.compressionSession) {
-        NSLog(@"[HeyJoeCapturer] Flushing compression session...");
-        VTCompressionSessionRef sessionToFlush = self.compressionSession;
-        dispatch_semaphore_t flushSem = dispatch_semaphore_create(0);
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-            VTCompressionSessionCompleteFrames(sessionToFlush, kCMTimeInvalid);
-            dispatch_semaphore_signal(flushSem);
-        });
-        // Wait up to 3 seconds — any remaining VT callbacks will dispatch_async
-        // back to this (recording) queue, so they'll be processed after this method returns
-        long flushResult = dispatch_semaphore_wait(flushSem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
-        if (flushResult != 0) {
-            NSLog(@"[HeyJoeCapturer] WARNING: Compression flush timed out after 3s");
-        } else {
-            NSLog(@"[HeyJoeCapturer] Compression session flushed");
-        }
-    }
-
-    // Step 3: Invalidate callback context + compression session
-    self.callbackContext.invalidated = YES;
-    if (self.compressionSession) {
-        VTCompressionSessionInvalidate(self.compressionSession);
-        CFRelease(self.compressionSession);
-        self.compressionSession = NULL;
-    }
-    // Release the CFBridgingRetain'd context ref
-    if (self.callbackContext) {
-        CFRelease((__bridge CFTypeRef)self.callbackContext);
-        self.callbackContext = nil;
-    }
-
-    // Step 4: Finalize asset writer
+    // Step 2: Finalize asset writer
     self.recordingState = HJRecordingStateFinalizing;
 
     if (!self.assetWriter || self.assetWriter.status != AVAssetWriterStatusWriting) {
@@ -1142,13 +899,12 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     self.recordingActive = NO;
     self.recordingStarting = NO;
     self.recordingState = HJRecordingStateIdle;
-    self.needsCompressionSetup = NO;
     self.hasWrittenFirstVideoFrame = NO;
     self.audioWriterInputAdded = NO;
     self.recordingStartTime = kCMTimeInvalid;
     self.recordingSetupError = nil;
-    self.consecutiveEncodeFailures = 0;
     self.audioFrameCount = 0;
+    self.pixelBufferAdaptor = nil;
     self.assetWriter = nil;
     self.videoWriterInput = nil;
     self.audioWriterInput = nil;
@@ -1225,7 +981,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
 }
 
-/// Must be called on recordingQueue. Encodes a video frame via VTCompressionSession.
+/// Must be called on recordingQueue. Appends a pixel buffer via AVAssetWriterInputPixelBufferAdaptor.
 - (void)_encodeVideoFrame:(CVPixelBufferRef)pixelBuffer timestamp:(CMTime)timestamp {
     // Check recording state
     if (self.recordingState != HJRecordingStateStarting &&
@@ -1233,8 +989,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         return;
     }
 
-    // Deferred compression session setup on first frame
-    if (self.needsCompressionSetup && !self.compressionSession) {
+    // Deferred asset writer setup on first frame
+    if (self.recordingState == HJRecordingStateStarting && !self.assetWriter) {
         int actualWidth = (int)CVPixelBufferGetWidth(pixelBuffer);
         int actualHeight = (int)CVPixelBufferGetHeight(pixelBuffer);
         OSType pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
@@ -1256,19 +1012,34 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             bitrate = 8000000; // 8 Mbps for 1080p
         }
 
-        NSLog(@"[HeyJoeCapturer] Setting up compression session: %dx%d @ %d Mbps (target: %s)",
+        NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps HEVC (target: %s)",
               targetWidth, targetHeight, bitrate / 1000000,
               self.recordingTargetResolution == HeyJoeRecordingResolution4K ? "4K" : "1080p");
 
-        if (![self _setupCompressionSessionWithWidth:targetWidth height:targetHeight bitrate:bitrate]) {
-            NSLog(@"[HeyJoeCapturer] Failed to setup compression session");
-            self.lastRecordingFailurePoint = @"compressionSetup";
+        if (![self _setupAssetWriterWithWidth:targetWidth height:targetHeight bitrate:bitrate]) {
+            NSLog(@"[HeyJoeCapturer] Failed to setup asset writer");
+            if (!self.lastRecordingFailurePoint) self.lastRecordingFailurePoint = @"assetWriterSetup";
             [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:5
-                userInfo:@{NSLocalizedDescriptionKey: @"Compression session creation failed"}]];
+                userInfo:@{NSLocalizedDescriptionKey: @"Asset writer setup failed"}]];
             return;
         }
 
-        self.needsCompressionSetup = NO;
+        // Start writing
+        if ([self.assetWriter startWriting]) {
+            [self.assetWriter startSessionAtSourceTime:timestamp];
+            self.recordingStartTime = timestamp;
+            NSLog(@"[HeyJoeCapturer] Asset writer started at time: %.3f", CMTimeGetSeconds(timestamp));
+        } else {
+            NSError *writerErr = self.assetWriter.error;
+            NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at startWriting: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld, URL=%@",
+                  writerErr.domain, (long)writerErr.code, writerErr.localizedDescription,
+                  writerErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status, self.recordingURL);
+            self.lastRecordingFailurePoint = @"startWriting";
+            [self _failRecordingWithError:writerErr ?: [NSError errorWithDomain:@"HeyJoeCapturer" code:10
+                userInfo:@{NSLocalizedDescriptionKey: @"Asset writer startWriting failed"}]];
+            return;
+        }
+
         // Transition: Starting → Recording
         self.recordingState = HJRecordingStateRecording;
         self.recordingActive = YES;
@@ -1276,7 +1047,8 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         NSLog(@"[HeyJoeCapturer] Recording state: Starting → Recording (recordingActive=YES)");
     }
 
-    if (self.compressionSession) {
+    // Append pixel buffer via adaptor
+    if (self.assetWriter.status == AVAssetWriterStatusWriting) {
         self.encodedFrameCount++;
         if (self.encodedFrameCount <= 3) {
             size_t w = CVPixelBufferGetWidth(pixelBuffer);
@@ -1286,28 +1058,28 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             NSLog(@"[HeyJoeCapturer] Encoding video frame #%d", self.encodedFrameCount);
         }
 
-        OSStatus status = VTCompressionSessionEncodeFrame(
-            self.compressionSession,
-            pixelBuffer,
-            timestamp,
-            kCMTimeInvalid,
-            NULL,
-            NULL,
-            NULL
-        );
-        if (status != noErr) {
-            self.consecutiveEncodeFailures++;
-            NSLog(@"[HeyJoeCapturer] Encode failed: OSStatus %d (consecutive: %d)", (int)status, self.consecutiveEncodeFailures);
-            if (self.consecutiveEncodeFailures >= 10) {
-                self.lastRecordingFailurePoint = @"encodeFailed";
-                [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:15
-                    userInfo:@{NSLocalizedDescriptionKey:
-                        [NSString stringWithFormat:@"Encoder failed %d consecutive frames (OSStatus %d)",
-                            self.consecutiveEncodeFailures, (int)status]}]];
+        if (self.videoWriterInput.readyForMoreMediaData) {
+            if ([self.pixelBufferAdaptor appendPixelBuffer:pixelBuffer withPresentationTime:timestamp]) {
+                self.hasWrittenFirstVideoFrame = YES;
+            } else {
+                NSError *appendErr = self.assetWriter.error;
+                NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at videoAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
+                      appendErr.domain, (long)appendErr.code, appendErr.localizedDescription,
+                      appendErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
+                self.lastRecordingFailurePoint = @"videoAppend";
+                if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                    [self _failRecordingWithError:appendErr];
+                    return;
+                }
             }
-        } else {
-            self.consecutiveEncodeFailures = 0;
         }
+    } else if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+        NSError *err = self.assetWriter.error;
+        NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at writerFailed: domain=%@ code=%ld desc=%@ underlying=%@",
+              err.domain, (long)err.code, err.localizedDescription, err.userInfo[NSUnderlyingErrorKey]);
+        self.lastRecordingFailurePoint = @"writerFailed";
+        [self _failRecordingWithError:err];
+        return;
     }
 }
 
@@ -1444,57 +1216,3 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 }
 
 @end
-
-#pragma mark - VTCompressionSession Callback
-
-static void compressionOutputCallback(void *outputCallbackRefCon,
-                                       void *sourceFrameRefCon,
-                                       OSStatus status,
-                                       VTEncodeInfoFlags infoFlags,
-                                       CMSampleBufferRef sampleBuffer) {
-    if (!outputCallbackRefCon) return;
-
-    // outputCallbackRefCon is a CFBridgingRetain'd HJCompressionCallbackContext.
-    // __bridge (no ownership transfer) since VT calls this callback multiple times.
-    // The retained ref is released when the compression session is invalidated.
-    HJCompressionCallbackContext *ctx = (__bridge HJCompressionCallbackContext *)outputCallbackRefCon;
-
-    // Fast atomic check — immediate cutoff if session was torn down
-    if (ctx.invalidated) return;
-
-    // Weak ref — nil if capturer was deallocated
-    HeyJoeVideoCapturer *capturer = ctx.capturer;
-    if (!capturer) return;
-
-    capturer.compressedCallbackCount++;
-    if (capturer.compressedCallbackCount <= 3 || capturer.compressedCallbackCount % 30 == 0) {
-        NSLog(@"[HeyJoeCapturer] Compression callback #%d, status=%d", capturer.compressedCallbackCount, (int)status);
-    }
-
-    if (status != noErr) {
-        NSLog(@"[HeyJoeCapturer] Compression error: %d", (int)status);
-        return;
-    }
-
-    if (!sampleBuffer) {
-        NSLog(@"[HeyJoeCapturer] Compression callback: sampleBuffer is NULL");
-        return;
-    }
-
-    // Retain sample buffer and dispatch to recordingQueue
-    CFRetain(sampleBuffer);
-    dispatch_async(ctx.recordingQueue, ^{
-        // Re-check invalidation after dispatch (context may have been invalidated while enqueued)
-        if (ctx.invalidated) {
-            CFRelease(sampleBuffer);
-            return;
-        }
-        HeyJoeVideoCapturer *cap = ctx.capturer;
-        if (!cap) {
-            CFRelease(sampleBuffer);
-            return;
-        }
-        // sampleBuffer ownership transferred to _handleCompressedFrame (it calls CFRelease)
-        [cap _handleCompressedFrame:sampleBuffer];
-    });
-}

@@ -14,20 +14,9 @@ typedef NS_ENUM(NSInteger, HJRecordingState) {
     HJRecordingStateIdle = 0,       // Not recording
     HJRecordingStateStarting,       // Waiting for first frame to set up compression
     HJRecordingStateRecording,      // Actively recording
-    HJRecordingStateDraining,       // Stop requested, flushing encoder
+    HJRecordingStateDraining,       // Stop requested, draining writer
     HJRecordingStateFinalizing,     // Writer being finalized
 };
-
-@class HeyJoeVideoCapturer;
-
-/// Ref-counted context object for VTCompressionSession callbacks.
-/// Prevents dangling pointer crashes: VT holds a strong ref to the context,
-/// but the capturer ref is weak — nil if deallocated.
-@interface HJCompressionCallbackContext : NSObject
-@property (weak, nullable) HeyJoeVideoCapturer *capturer;
-@property (strong) dispatch_queue_t recordingQueue;
-@property (atomic, assign) BOOL invalidated;
-@end
 
 /**
  * HeyJoeVideoCapturer - Single-session video capturer with 4K recording support
@@ -35,7 +24,7 @@ typedef NS_ENUM(NSInteger, HJRecordingState) {
  * Queue Architecture (4 queues, zero dispatch_sync between them):
  *
  * captureQueue (serial)  — AVCaptureSession lifecycle only
- * recordingQueue (serial) — ALL recording state, VTCompress, AVAssetWriter
+ * recordingQueue (serial) — ALL recording state, pixel buffer adaptor, AVAssetWriter
  * videoOutputQueue (serial) — video callback delivery only
  * audioOutputQueue (serial) — audio callback delivery only
  *
@@ -71,9 +60,6 @@ typedef NS_ENUM(NSInteger, HJRecordingState) {
 
 /// Tracks which code path triggered the last recording failure (for diagnostics)
 @property (nonatomic, strong, nullable) NSString *lastRecordingFailurePoint;
-
-/// Counts consecutive VTCompressionSessionEncodeFrame failures (for diagnostics)
-@property (nonatomic, assign) int consecutiveEncodeFailures;
 
 /// Shared instance for global access
 + (nullable instancetype)sharedInstance;
