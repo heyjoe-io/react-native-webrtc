@@ -484,7 +484,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         AVVideoCompressionPropertiesKey: @{
             AVVideoAverageBitRateKey: @(bitrate),
             AVVideoMaxKeyFrameIntervalKey: @(60),
-            AVVideoProfileLevelKey: AVVideoProfileLevelHEVC_Main_AutoLevel,
             AVVideoExpectedSourceFrameRateKey: @(30),
             AVVideoAllowFrameReorderingKey: @YES
         }
