@@ -64,11 +64,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 // Atomic because it's written on main queue but read on recordingQueue.
 @property (atomic, assign) UIDeviceOrientation cachedDeviceOrientation;
 
-// Detected audio format — written once on audioOutputQueue from the first audio sample,
-// read on recordingQueue when setting up the asset writer. Atomic for cross-queue safety.
-@property (atomic, assign) int detectedAudioSampleRate;
-@property (atomic, assign) int detectedAudioChannels;
-
 @end
 
 @implementation HeyJoeVideoCapturer
@@ -522,20 +517,18 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoWriterInput
                                    sourcePixelBufferAttributes:sourcePixelBufferAttributes];
 
-    // Audio output settings — use detected format from the capture session.
-    // The device may provide multi-channel audio (e.g., 4-channel mic array during
-    // WebRTC calls). We output stereo (2ch) which is universally supported by AAC
-    // and handles any input channel count via automatic downmix.
-    int outSampleRate = self.detectedAudioSampleRate ?: 48000;
-    int inputChannels = self.detectedAudioChannels;
-    int outChannels = (inputChannels >= 2) ? 2 : 1;
-    int audioBitrate = (outChannels == 2) ? 128000 : 64000;
+    // Audio output settings — hardcoded stereo 48kHz.
+    // iOS WebRTC always provides 48kHz audio. Multi-mic arrays give 4 channels,
+    // single-mic gives 1 channel — AAC handles both 4→2 downmix and 1→2 upmix.
+    // Hardcoding avoids a race condition where the audio format detection code
+    // hasn't run yet when the writer is configured (video frame arrives first).
+    int outSampleRate = 48000;
+    int outChannels = 2;
+    int audioBitrate = 128000;
 
     AudioChannelLayout acl;
     memset(&acl, 0, sizeof(acl));
-    acl.mChannelLayoutTag = (outChannels == 2)
-        ? kAudioChannelLayoutTag_Stereo
-        : kAudioChannelLayoutTag_Mono;
+    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
 
     NSDictionary *audioSettings = @{
         AVFormatIDKey: @(kAudioFormatMPEG4AAC),
@@ -545,9 +538,8 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         AVChannelLayoutKey: [NSData dataWithBytes:&acl length:sizeof(acl)]
     };
 
-    NSLog(@"[HeyJoeCapturer] Audio settings: %dHz %dch→%dch AAC @ %dkbps (layout=%s)",
-          outSampleRate, inputChannels, outChannels, audioBitrate / 1000,
-          outChannels == 2 ? "Stereo" : "Mono");
+    NSLog(@"[HeyJoeCapturer] Audio settings: %dHz %dch stereo AAC @ %dkbps",
+          outSampleRate, outChannels, audioBitrate / 1000);
 
     self.audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
                                                                outputSettings:audioSettings];
@@ -1028,21 +1020,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
     // Handle audio frames (delivered on audioOutputQueue)
     else if (output == self.audioDataOutput) {
-        // Detect audio format from the first sample — runs once, before any recording.
-        // Atomic properties ensure the values are visible to recordingQueue when needed.
-        if (self.detectedAudioSampleRate == 0) {
-            CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
-            if (fmt) {
-                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
-                if (asbd) {
-                    self.detectedAudioSampleRate = (int)asbd->mSampleRate;
-                    self.detectedAudioChannels = (int)asbd->mChannelsPerFrame;
-                    NSLog(@"[HeyJoeCapturer] Detected audio format: %dHz, %d channels",
-                          self.detectedAudioSampleRate, self.detectedAudioChannels);
-                }
-            }
-        }
-
         if (self.recordingActive) {
             CFRetain(sampleBuffer);
             dispatch_async(self.recordingQueue, ^{
