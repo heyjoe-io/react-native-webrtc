@@ -350,8 +350,16 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
             NSLog(@"[HeyJoeCapturer] Cannot add video data output");
         }
 
-        // Add audio data output — delivered on audioOutputQueue
+        // Add audio data output — delivered on audioOutputQueue.
+        // Force stereo 48kHz PCM so the capture pipeline downmixes the hardware's
+        // 4-channel mic array to 2ch before samples reach our delegate. Without this,
+        // AVAssetWriterInput receives 4ch samples but is configured for 2ch AAC → -12780.
         self.audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
+        self.audioDataOutput.audioSettings = @{
+            AVFormatIDKey: @(kAudioFormatLinearPCM),
+            AVNumberOfChannelsKey: @2,
+            AVSampleRateKey: @48000.0
+        };
         [self.audioDataOutput setSampleBufferDelegate:self queue:self.audioOutputQueue];
 
         if ([self.captureSession canAddOutput:self.audioDataOutput]) {
