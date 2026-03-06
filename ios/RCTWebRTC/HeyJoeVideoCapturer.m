@@ -64,6 +64,11 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 // Atomic because it's written on main queue but read on recordingQueue.
 @property (atomic, assign) UIDeviceOrientation cachedDeviceOrientation;
 
+// Detected audio format — written once on audioOutputQueue from the first audio sample,
+// read on recordingQueue when setting up the asset writer. Atomic for cross-queue safety.
+@property (atomic, assign) int detectedAudioSampleRate;
+@property (atomic, assign) int detectedAudioChannels;
+
 @end
 
 @implementation HeyJoeVideoCapturer
@@ -517,16 +522,32 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.videoWriterInput
                                    sourcePixelBufferAttributes:sourcePixelBufferAttributes];
 
-    // Audio output settings — use 48kHz to match device sample rate.
-    // Do NOT specify AVChannelLayoutKey — the device may provide 4-channel audio
-    // (multi-mic array during WebRTC calls) and an explicit mono layout tag
-    // causes the AAC encoder to reject the 4→1 downmix.
+    // Audio output settings — use detected format from the capture session.
+    // The device may provide multi-channel audio (e.g., 4-channel mic array during
+    // WebRTC calls). We output stereo (2ch) which is universally supported by AAC
+    // and handles any input channel count via automatic downmix.
+    int outSampleRate = self.detectedAudioSampleRate ?: 48000;
+    int inputChannels = self.detectedAudioChannels;
+    int outChannels = (inputChannels >= 2) ? 2 : 1;
+    int audioBitrate = (outChannels == 2) ? 128000 : 64000;
+
+    AudioChannelLayout acl;
+    memset(&acl, 0, sizeof(acl));
+    acl.mChannelLayoutTag = (outChannels == 2)
+        ? kAudioChannelLayoutTag_Stereo
+        : kAudioChannelLayoutTag_Mono;
+
     NSDictionary *audioSettings = @{
         AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey: @(48000),
-        AVNumberOfChannelsKey: @(1),
-        AVEncoderBitRateKey: @(128000)
+        AVSampleRateKey: @(outSampleRate),
+        AVNumberOfChannelsKey: @(outChannels),
+        AVEncoderBitRateKey: @(audioBitrate),
+        AVChannelLayoutKey: [NSData dataWithBytes:&acl length:sizeof(acl)]
     };
+
+    NSLog(@"[HeyJoeCapturer] Audio settings: %dHz %dch→%dch AAC @ %dkbps (layout=%s)",
+          outSampleRate, inputChannels, outChannels, audioBitrate / 1000,
+          outChannels == 2 ? "Stereo" : "Mono");
 
     self.audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
                                                                outputSettings:audioSettings];
@@ -543,10 +564,13 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
         return NO;
     }
 
-    // DIAGNOSTIC: Skip audio to isolate whether -12780 is from video or audio encoder.
-    // If video-only recording works, the audio config (4ch→1ch downmix) is the problem.
-    self.audioWriterInputAdded = NO;
-    NSLog(@"[HeyJoeCapturer] DIAGNOSTIC: Audio input SKIPPED to isolate encoder error");
+    if ([self.assetWriter canAddInput:self.audioWriterInput]) {
+        [self.assetWriter addInput:self.audioWriterInput];
+        self.audioWriterInputAdded = YES;
+    } else {
+        NSLog(@"[HeyJoeCapturer] Cannot add audio writer input — continuing without audio");
+        self.audioWriterInputAdded = NO;
+    }
 
     NSLog(@"[HeyJoeCapturer] Asset writer created: video=added (H.264 %dx%d), audio=%s, URL=%@",
           width, height,
@@ -1004,6 +1028,21 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
     // Handle audio frames (delivered on audioOutputQueue)
     else if (output == self.audioDataOutput) {
+        // Detect audio format from the first sample — runs once, before any recording.
+        // Atomic properties ensure the values are visible to recordingQueue when needed.
+        if (self.detectedAudioSampleRate == 0) {
+            CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+            if (fmt) {
+                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+                if (asbd) {
+                    self.detectedAudioSampleRate = (int)asbd->mSampleRate;
+                    self.detectedAudioChannels = (int)asbd->mChannelsPerFrame;
+                    NSLog(@"[HeyJoeCapturer] Detected audio format: %dHz, %d channels",
+                          self.detectedAudioSampleRate, self.detectedAudioChannels);
+                }
+            }
+        }
+
         if (self.recordingActive) {
             CFRetain(sampleBuffer);
             dispatch_async(self.recordingQueue, ^{
