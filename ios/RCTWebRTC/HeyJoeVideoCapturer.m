@@ -315,6 +315,17 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
             NSLog(@"[HeyJoeCapturer] Could not lock camera for configuration: %@", error);
         }
 
+        // Request stereo input from the audio session so the hardware delivers
+        // 2-channel PCM instead of the raw mic array (4ch on modern iPhones).
+        // This must happen before adding the audio input to the capture session.
+        NSError *audioSessionError = nil;
+        [[AVAudioSession sharedInstance] setPreferredInputNumberOfChannels:2 error:&audioSessionError];
+        if (audioSessionError) {
+            NSLog(@"[HeyJoeCapturer] Warning: could not set preferred input channels: %@", audioSessionError);
+        } else {
+            NSLog(@"[HeyJoeCapturer] Preferred input channels set to 2 (stereo)");
+        }
+
         // Add audio input for recording
         AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
         if (audioDevice) {
@@ -350,16 +361,8 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
             NSLog(@"[HeyJoeCapturer] Cannot add video data output");
         }
 
-        // Add audio data output — delivered on audioOutputQueue.
-        // Force stereo 48kHz PCM so the capture pipeline downmixes the hardware's
-        // 4-channel mic array to 2ch before samples reach our delegate. Without this,
-        // AVAssetWriterInput receives 4ch samples but is configured for 2ch AAC → -12780.
+        // Add audio data output — delivered on audioOutputQueue
         self.audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
-        self.audioDataOutput.audioSettings = @{
-            AVFormatIDKey: @(kAudioFormatLinearPCM),
-            AVNumberOfChannelsKey: @2,
-            AVSampleRateKey: @48000.0
-        };
         [self.audioDataOutput setSampleBufferDelegate:self queue:self.audioOutputQueue];
 
         if ([self.captureSession canAddOutput:self.audioDataOutput]) {
