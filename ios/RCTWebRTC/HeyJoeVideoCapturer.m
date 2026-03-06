@@ -315,17 +315,6 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
             NSLog(@"[HeyJoeCapturer] Could not lock camera for configuration: %@", error);
         }
 
-        // Request stereo input from the audio session so the hardware delivers
-        // 2-channel PCM instead of the raw mic array (4ch on modern iPhones).
-        // This must happen before adding the audio input to the capture session.
-        NSError *audioSessionError = nil;
-        [[AVAudioSession sharedInstance] setPreferredInputNumberOfChannels:2 error:&audioSessionError];
-        if (audioSessionError) {
-            NSLog(@"[HeyJoeCapturer] Warning: could not set preferred input channels: %@", audioSessionError);
-        } else {
-            NSLog(@"[HeyJoeCapturer] Preferred input channels set to 2 (stereo)");
-        }
-
         // Add audio input for recording
         AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
         if (audioDevice) {
@@ -582,6 +571,70 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     return YES;
 }
 
+/// Downmixes a multi-channel interleaved PCM sample buffer to stereo by extracting
+/// the first 2 channels. Returns NULL if already ≤2ch or on error.
+/// Caller must CFRelease the returned buffer.
+- (CMSampleBufferRef)_stereoBufferFromMultiChannel:(CMSampleBufferRef)sampleBuffer {
+    CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt);
+    if (!asbd || asbd->mChannelsPerFrame <= 2) return NULL;
+
+    UInt32 bytesPerSample = asbd->mBitsPerChannel / 8;
+    UInt32 inBPF = bytesPerSample * asbd->mChannelsPerFrame;
+    UInt32 outBPF = bytesPerSample * 2;
+    CMItemCount numFrames = CMSampleBufferGetNumSamples(sampleBuffer);
+    size_t outLen = (size_t)numFrames * outBPF;
+
+    CMBlockBufferRef srcBlock = CMSampleBufferGetDataBuffer(sampleBuffer);
+    if (!srcBlock) return NULL;
+    size_t srcLen;
+    char *srcPtr;
+    if (CMBlockBufferGetDataPointer(srcBlock, 0, NULL, &srcLen, &srcPtr) != noErr) return NULL;
+
+    // Take first 2 channels from each interleaved frame
+    void *outData = malloc(outLen);
+    if (!outData) return NULL;
+    for (CMItemCount i = 0; i < numFrames; i++) {
+        memcpy((uint8_t *)outData + i * outBPF,
+               (uint8_t *)srcPtr + i * inBPF, outBPF);
+    }
+
+    // Wrap in CMBlockBuffer (kCFAllocatorMalloc will free outData)
+    CMBlockBufferRef outBlock = NULL;
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault, outData, outLen,
+        kCFAllocatorMalloc, NULL, 0, outLen, 0, &outBlock);
+    if (st != noErr) { free(outData); return NULL; }
+
+    // Stereo format description
+    AudioStreamBasicDescription stereoASBD = *asbd;
+    stereoASBD.mChannelsPerFrame = 2;
+    stereoASBD.mBytesPerFrame = outBPF;
+    stereoASBD.mBytesPerPacket = outBPF;
+
+    AudioChannelLayout acl;
+    memset(&acl, 0, sizeof(acl));
+    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo;
+
+    CMAudioFormatDescriptionRef stereoFmt = NULL;
+    st = CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &stereoASBD,
+                                        sizeof(acl), &acl, 0, NULL, NULL, &stereoFmt);
+    if (st != noErr) { CFRelease(outBlock); return NULL; }
+
+    // New sample buffer
+    CMSampleTimingInfo timing;
+    CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing);
+
+    CMSampleBufferRef stereoBuf = NULL;
+    st = CMAudioSampleBufferCreateWithPacketDescriptions(
+        kCFAllocatorDefault, outBlock, true, NULL, NULL,
+        stereoFmt, numFrames, timing.presentationTimeStamp, NULL, &stereoBuf);
+
+    CFRelease(outBlock);
+    CFRelease(stereoFmt);
+    return (st == noErr) ? stereoBuf : NULL;
+}
+
 /// Must be called on recordingQueue. Handles audio sample from audioOutputQueue.
 - (void)_handleAudioSample:(CMSampleBufferRef)sampleBuffer {
     if (self.recordingState != HJRecordingStateRecording) {
@@ -590,15 +643,11 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
     }
 
     if (!self.hasWrittenFirstVideoFrame) {
-        // Don't write audio before the first video frame
         CFRelease(sampleBuffer);
         return;
     }
 
     // Drop audio samples with PTS before the recording session start time.
-    // After room transitions, an audio sample captured just before the first
-    // video frame can have a PTS slightly earlier than startSessionAtSourceTime,
-    // which can cause the writer to fail.
     CMTime audioPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     if (CMTIME_IS_VALID(self.recordingStartTime) &&
         CMTimeCompare(audioPTS, self.recordingStartTime) < 0) {
@@ -612,30 +661,38 @@ static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
     if (self.assetWriter.status == AVAssetWriterStatusWriting &&
         self.audioWriterInput.readyForMoreMediaData) {
-        // Log first audio frame format (encodedFrameCount resets per recording)
+
+        // Downmix >2ch to stereo. iOS mic arrays deliver 4ch but the AAC
+        // encoder only supports 1-2ch. AVAssetWriterInput won't auto-downmix.
+        CMSampleBufferRef stereoBuffer = [self _stereoBufferFromMultiChannel:sampleBuffer];
+        CMSampleBufferRef bufferToAppend = stereoBuffer ?: sampleBuffer;
+
         if (self.audioFrameCount == 0) {
-            CMFormatDescriptionRef audioFmt = CMSampleBufferGetFormatDescription(sampleBuffer);
-            if (audioFmt) {
-                const AudioStreamBasicDescription *asbd = CMAudioFormatDescriptionGetStreamBasicDescription(audioFmt);
-                if (asbd) {
-                    NSLog(@"[HeyJoeCapturer] First audio frame: sampleRate=%.0f, channels=%u, formatID=%.4s",
-                          asbd->mSampleRate, (unsigned)asbd->mChannelsPerFrame, (char *)&asbd->mFormatID);
-                }
-            }
+            CMFormatDescriptionRef inFmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+            CMFormatDescriptionRef outFmt = CMSampleBufferGetFormatDescription(bufferToAppend);
+            const AudioStreamBasicDescription *inASBD = inFmt ? CMAudioFormatDescriptionGetStreamBasicDescription(inFmt) : NULL;
+            const AudioStreamBasicDescription *outASBD = outFmt ? CMAudioFormatDescriptionGetStreamBasicDescription(outFmt) : NULL;
+            NSLog(@"[HeyJoeCapturer] First audio frame: %.0fHz %uch → %uch %s",
+                  inASBD ? inASBD->mSampleRate : 0,
+                  inASBD ? (unsigned)inASBD->mChannelsPerFrame : 0,
+                  outASBD ? (unsigned)outASBD->mChannelsPerFrame : 0,
+                  stereoBuffer ? "(downmixed)" : "(passthrough)");
         }
         self.audioFrameCount++;
-        if (![self.audioWriterInput appendSampleBuffer:sampleBuffer]) {
+        if (![self.audioWriterInput appendSampleBuffer:bufferToAppend]) {
             NSError *audioErr = self.assetWriter.error;
             NSLog(@"[HeyJoeCapturer] RECORDING FAILURE at audioAppend: domain=%@ code=%ld desc=%@ underlying=%@, writerStatus=%ld",
                   audioErr.domain, (long)audioErr.code, audioErr.localizedDescription,
                   audioErr.userInfo[NSUnderlyingErrorKey], (long)self.assetWriter.status);
             self.lastRecordingFailurePoint = @"audioAppend";
             if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                if (stereoBuffer) CFRelease(stereoBuffer);
                 CFRelease(sampleBuffer);
                 [self _failRecordingWithError:audioErr];
                 return;
             }
         }
+        if (stereoBuffer) CFRelease(stereoBuffer);
     }
 
     CFRelease(sampleBuffer);
