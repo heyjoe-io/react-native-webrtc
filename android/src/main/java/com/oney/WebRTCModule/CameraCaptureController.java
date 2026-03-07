@@ -49,17 +49,40 @@ public class CameraCaptureController extends AbstractVideoCaptureController {
     }
 
     public void switchCamera() {
-        if (videoCapturer instanceof CameraVideoCapturer) {
-            CameraVideoCapturer capturer = (CameraVideoCapturer) videoCapturer;
+        if (videoCapturer instanceof HeyJoeVideoCapturer) {
+            HeyJoeVideoCapturer heyJoe = (HeyJoeVideoCapturer) videoCapturer;
             String[] deviceNames = cameraEnumerator.getDeviceNames();
             int deviceCount = deviceNames.length;
 
-            // Nothing to switch to.
             if (deviceCount < 2) {
                 return;
             }
 
-            // The usual case.
+            if (deviceCount == 2) {
+                heyJoe.switchCamera(new CameraVideoCapturer.CameraSwitchHandler() {
+                    @Override
+                    public void onCameraSwitchDone(boolean b) {
+                        isFrontFacing = b;
+                    }
+
+                    @Override
+                    public void onCameraSwitchError(String s) {
+                        Log.e(TAG, "Error switching camera: " + s);
+                    }
+                });
+                return;
+            }
+
+            switchCamera(!isFrontFacing, deviceCount);
+        } else if (videoCapturer instanceof CameraVideoCapturer) {
+            CameraVideoCapturer capturer = (CameraVideoCapturer) videoCapturer;
+            String[] deviceNames = cameraEnumerator.getDeviceNames();
+            int deviceCount = deviceNames.length;
+
+            if (deviceCount < 2) {
+                return;
+            }
+
             if (deviceCount == 2) {
                 capturer.switchCamera(new CameraVideoCapturer.CameraSwitchHandler() {
                     @Override
@@ -75,8 +98,6 @@ public class CameraCaptureController extends AbstractVideoCaptureController {
                 return;
             }
 
-            // If we are here the device has more than 2 cameras. Cycle through them
-            // and switch to the first one of the desired facing mode.
             switchCamera(!isFrontFacing, deviceCount);
         }
     }
@@ -109,7 +130,10 @@ public class CameraCaptureController extends AbstractVideoCaptureController {
             actualHeight = actualSize.height;
         }
 
-        return videoCapturer;
+        // Wrap in HeyJoeVideoCapturer for high-res recording support
+        HeyJoeVideoCapturer heyJoe = HeyJoeVideoCapturer.getInstance();
+        heyJoe.setInnerCapturer(videoCapturer, cameraEnumerator, cameraName, context);
+        return heyJoe;
     }
 
     /**
@@ -119,9 +143,7 @@ public class CameraCaptureController extends AbstractVideoCaptureController {
      * @param tries - How many times to try switching.
      */
     private void switchCamera(boolean desiredFrontFacing, int tries) {
-        CameraVideoCapturer capturer = (CameraVideoCapturer) videoCapturer;
-
-        capturer.switchCamera(new CameraVideoCapturer.CameraSwitchHandler() {
+        CameraVideoCapturer.CameraSwitchHandler handler = new CameraVideoCapturer.CameraSwitchHandler() {
             @Override
             public void onCameraSwitchDone(boolean b) {
                 if (b != desiredFrontFacing) {
@@ -138,7 +160,13 @@ public class CameraCaptureController extends AbstractVideoCaptureController {
             public void onCameraSwitchError(String s) {
                 Log.e(TAG, "Error switching camera: " + s);
             }
-        });
+        };
+
+        if (videoCapturer instanceof HeyJoeVideoCapturer) {
+            ((HeyJoeVideoCapturer) videoCapturer).switchCamera(handler);
+        } else if (videoCapturer instanceof CameraVideoCapturer) {
+            ((CameraVideoCapturer) videoCapturer).switchCamera(handler);
+        }
     }
 
     /**
