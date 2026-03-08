@@ -12,6 +12,7 @@ import android.opengl.GLES20;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
+import android.view.OrientationEventListener;
 import android.view.Surface;
 
 import org.webrtc.CapturerObserver;
@@ -84,6 +85,10 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     // WebRTC-requested resolution (we capture higher, scale down for WebRTC)
     private volatile int webrtcWidth;
     private volatile int webrtcHeight;
+
+    // Orientation tracking (mirrors iOS cachedDeviceOrientation)
+    private OrientationEventListener orientationListener;
+    private volatile int deviceOrientationDegrees = 0; // 0, 90, 180, 270
 
     // Recording state machine: Idle → Starting → Recording → Stopping → Idle
     // All transitions guarded by stateLock
@@ -190,6 +195,29 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
                            CapturerObserver capturerObserver) {
         if (this.context == null) {
             this.context = applicationContext;
+        }
+
+        // Start orientation listener (mirrors iOS cachedDeviceOrientation)
+        if (orientationListener == null) {
+            orientationListener = new OrientationEventListener(applicationContext) {
+                @Override
+                public void onOrientationChanged(int orientation) {
+                    if (orientation == ORIENTATION_UNKNOWN) return;
+                    // Snap to nearest 90-degree increment
+                    if (orientation >= 315 || orientation < 45) {
+                        deviceOrientationDegrees = 0;   // Portrait
+                    } else if (orientation >= 45 && orientation < 135) {
+                        deviceOrientationDegrees = 270; // Landscape right
+                    } else if (orientation >= 135 && orientation < 225) {
+                        deviceOrientationDegrees = 180; // Upside down
+                    } else {
+                        deviceOrientationDegrees = 90;  // Landscape left
+                    }
+                }
+            };
+            if (orientationListener.canDetectOrientation()) {
+                orientationListener.enable();
+            }
         }
 
         // Wrap the observer to intercept frames for recording
@@ -307,6 +335,10 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
                 Log.w(TAG, "Disposing while recording — force stopping");
                 forceResetRecordingStateLocked();
             }
+        }
+        if (orientationListener != null) {
+            orientationListener.disable();
+            orientationListener = null;
         }
         if (innerCapturer != null) {
             innerCapturer.dispose();
@@ -663,6 +695,12 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
         // Create muxer
         mediaMuxer = new MediaMuxer(currentFilePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+        // Set orientation hint so the MP4 plays back in the correct orientation
+        // Must be called before muxer.start()
+        int orientationHint = deviceOrientationDegrees;
+        mediaMuxer.setOrientationHint(orientationHint);
+        Log.d(TAG, "Muxer orientation hint set to: " + orientationHint + " degrees");
 
         // Setup video encoder (H.264 with Surface input)
         MediaFormat videoFormat = MediaFormat.createVideoFormat(
