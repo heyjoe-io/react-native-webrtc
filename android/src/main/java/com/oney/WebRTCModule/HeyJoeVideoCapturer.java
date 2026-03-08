@@ -81,6 +81,10 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     private volatile int captureHeight;
     private int captureFps;
 
+    // WebRTC-requested resolution (we capture higher, scale down for WebRTC)
+    private volatile int webrtcWidth;
+    private volatile int webrtcHeight;
+
     // Recording state machine: Idle → Starting → Recording → Stopping → Idle
     // All transitions guarded by stateLock
     private enum RecordingState { IDLE, STARTING, RECORDING, STOPPING }
@@ -212,10 +216,27 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
             @Override
             public void onFrameCaptured(VideoFrame frame) {
-                // Forward to WebRTC
-                capturerObserver.onFrameCaptured(frame);
+                // Scale down to WebRTC-requested resolution (e.g., 720p)
+                // Camera captures at 1080p+, but WebRTC only needs 720p
+                int targetW = webrtcWidth;
+                int targetH = webrtcHeight;
+                VideoFrame.Buffer buf = frame.getBuffer();
+                int bufW = buf.getWidth();
+                int bufH = buf.getHeight();
 
-                // Forward to recording pipeline if active
+                if (targetW > 0 && targetH > 0
+                        && (bufW != targetW || bufH != targetH)) {
+                    VideoFrame.Buffer scaled = buf.cropAndScale(
+                            0, 0, bufW, bufH, targetW, targetH);
+                    VideoFrame scaledFrame = new VideoFrame(
+                            scaled, frame.getRotation(), frame.getTimestampNs());
+                    capturerObserver.onFrameCaptured(scaledFrame);
+                    scaledFrame.release();
+                } else {
+                    capturerObserver.onFrameCaptured(frame);
+                }
+
+                // Forward full-res to recording pipeline if active
                 if (recordingState == RecordingState.RECORDING) {
                     Handler handler = encoderHandler;
                     if (handler != null) {
@@ -230,10 +251,28 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
     @Override
     public void startCapture(int width, int height, int fps) {
-        this.captureWidth = width;
-        this.captureHeight = height;
+        // Save WebRTC-requested resolution (e.g., 720p)
+        this.webrtcWidth = width;
+        this.webrtcHeight = height;
         this.captureFps = fps;
-        innerCapturer.startCapture(width, height, fps);
+
+        // Request higher resolution from camera for recording (at least 1080p)
+        int captureW, captureH;
+        if (height > width) {
+            // Portrait
+            captureW = Math.max(width, 1080);
+            captureH = Math.max(height, 1920);
+        } else {
+            // Landscape
+            captureW = Math.max(width, 1920);
+            captureH = Math.max(height, 1080);
+        }
+        this.captureWidth = captureW;
+        this.captureHeight = captureH;
+
+        Log.d(TAG, "startCapture: WebRTC=" + width + "x" + height
+                + ", Camera=" + captureW + "x" + captureH + " @ " + fps + "fps");
+        innerCapturer.startCapture(captureW, captureH, fps);
     }
 
     @Override
@@ -243,10 +282,22 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
     @Override
     public void changeCaptureFormat(int width, int height, int fps) {
-        this.captureWidth = width;
-        this.captureHeight = height;
+        this.webrtcWidth = width;
+        this.webrtcHeight = height;
         this.captureFps = fps;
-        innerCapturer.changeCaptureFormat(width, height, fps);
+
+        int captureW, captureH;
+        if (height > width) {
+            captureW = Math.max(width, 1080);
+            captureH = Math.max(height, 1920);
+        } else {
+            captureW = Math.max(width, 1920);
+            captureH = Math.max(height, 1080);
+        }
+        this.captureWidth = captureW;
+        this.captureHeight = captureH;
+
+        innerCapturer.changeCaptureFormat(captureW, captureH, fps);
     }
 
     @Override
