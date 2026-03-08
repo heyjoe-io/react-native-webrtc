@@ -90,6 +90,10 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     private OrientationEventListener orientationListener;
     private volatile int deviceOrientationDegrees = 0; // 0, 90, 180, 270
 
+    // Camera sensor orientation (set via setInnerCapturer)
+    private int sensorOrientation = 90; // default for most rear cameras
+    private boolean isFrontCamera = false;
+
     // Recording state machine: Idle → Starting → Recording → Stopping → Idle
     // All transitions guarded by stateLock
     private enum RecordingState { IDLE, STARTING, RECORDING, STOPPING }
@@ -185,7 +189,36 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
         this.cameraEnumerator = enumerator;
         this.cameraName = camName;
         this.context = ctx;
-        Log.d(TAG, "Inner capturer set: " + camName);
+
+        // Detect front/rear camera for orientation calculation
+        this.isFrontCamera = enumerator.isFrontFacing(camName);
+
+        // Get sensor orientation from Camera2 API
+        try {
+            android.hardware.camera2.CameraManager camManager =
+                    (android.hardware.camera2.CameraManager) ctx.getSystemService(Context.CAMERA_SERVICE);
+            for (String id : camManager.getCameraIdList()) {
+                android.hardware.camera2.CameraCharacteristics chars =
+                        camManager.getCameraCharacteristics(id);
+                // Match by facing direction
+                Integer facing = chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING);
+                boolean idIsFront = facing != null
+                        && facing == android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT;
+                if (idIsFront == this.isFrontCamera) {
+                    Integer sensorOr = chars.get(
+                            android.hardware.camera2.CameraCharacteristics.SENSOR_ORIENTATION);
+                    if (sensorOr != null) {
+                        this.sensorOrientation = sensorOr;
+                    }
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Could not get sensor orientation, using default 90", e);
+        }
+
+        Log.d(TAG, "Inner capturer set: " + camName
+                + ", front=" + isFrontCamera + ", sensorOrientation=" + sensorOrientation);
     }
 
     // --- VideoCapturer interface (delegated to inner capturer) ---
@@ -407,23 +440,14 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
         currentFilePath = filePath;
 
-        // Calculate encoder dimensions based on capture orientation
+        // Always encode in landscape — orientation is handled by muxer metadata
+        // (mirrors iOS: pixel buffer is fixed in landscape, transform rotates on playback)
         if (enable4K) {
-            if (captureHeight > captureWidth) {
-                encoderWidth = 2160;
-                encoderHeight = 3840;
-            } else {
-                encoderWidth = 3840;
-                encoderHeight = 2160;
-            }
+            encoderWidth = 3840;
+            encoderHeight = 2160;
         } else {
-            if (captureHeight > captureWidth) {
-                encoderWidth = 1080;
-                encoderHeight = 1920;
-            } else {
-                encoderWidth = 1920;
-                encoderHeight = 1080;
-            }
+            encoderWidth = 1920;
+            encoderHeight = 1080;
         }
 
         int bitrate = enable4K ? BITRATE_4K : BITRATE_1080P;
@@ -696,11 +720,24 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
         // Create muxer
         mediaMuxer = new MediaMuxer(currentFilePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 
-        // Set orientation hint so the MP4 plays back in the correct orientation
-        // Must be called before muxer.start()
-        int orientationHint = deviceOrientationDegrees;
+        // Compute orientation hint for correct playback rotation.
+        // We encode raw landscape pixels (no rotation applied), so the hint tells players
+        // how to rotate the video for correct display — same as iOS AVAssetWriterInput.transform.
+        //
+        // Standard Android formula:
+        //   Back camera:  hint = (sensorOrientation - deviceOrientation + 360) % 360
+        //   Front camera: hint = (sensorOrientation + deviceOrientation) % 360
+        int deviceOr = deviceOrientationDegrees;
+        int orientationHint;
+        if (isFrontCamera) {
+            orientationHint = (sensorOrientation + deviceOr) % 360;
+        } else {
+            orientationHint = (sensorOrientation - deviceOr + 360) % 360;
+        }
         mediaMuxer.setOrientationHint(orientationHint);
-        Log.d(TAG, "Muxer orientation hint set to: " + orientationHint + " degrees");
+        Log.d(TAG, "Muxer orientation hint: " + orientationHint
+                + "° (sensor=" + sensorOrientation + ", device=" + deviceOr
+                + ", front=" + isFrontCamera + ")");
 
         // Setup video encoder (H.264 with Surface input)
         MediaFormat videoFormat = MediaFormat.createVideoFormat(
@@ -769,10 +806,13 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
         // Capture wall-clock time for this frame's PTS
         final long frameWallTimeNs = System.nanoTime();
 
-        // Retain and copy the frame for async processing on encoder thread
+        // Copy the frame WITHOUT rotation for the encoder.
+        // We encode raw landscape pixels (same as the camera sensor produces).
+        // Rotation is handled by the muxer's orientationHint metadata.
+        // (Mirrors iOS: pixel buffer is fixed in landscape, transform rotates on playback)
         final VideoFrame frameCopy = new VideoFrame(
                 frame.getBuffer(),
-                frame.getRotation(),
+                0,  // No rotation — muxer orientationHint handles display rotation
                 frame.getTimestampNs()
         );
         frameCopy.retain();
