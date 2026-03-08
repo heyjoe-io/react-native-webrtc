@@ -94,6 +94,9 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     private int sensorOrientation = 90; // default for most rear cameras
     private boolean isFrontCamera = false;
 
+    // Last known frame rotation from WebRTC (set on every frame, used for recording orientation)
+    private volatile int lastFrameRotation = 0;
+
     // Recording state machine: Idle → Starting → Recording → Stopping → Idle
     // All transitions guarded by stateLock
     private enum RecordingState { IDLE, STARTING, RECORDING, STOPPING }
@@ -277,6 +280,10 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
 
             @Override
             public void onFrameCaptured(VideoFrame frame) {
+                // Track frame rotation — WebRTC computes this correctly for each camera
+                // Used as the muxer orientationHint when recording starts
+                lastFrameRotation = frame.getRotation();
+
                 // Scale down to WebRTC-requested resolution (e.g., 720p)
                 // Camera captures at 1080p+, but WebRTC only needs 720p
                 int targetW = webrtcWidth;
@@ -720,24 +727,14 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
         // Create muxer
         mediaMuxer = new MediaMuxer(currentFilePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 
-        // Compute orientation hint for correct playback rotation.
-        // We encode raw landscape pixels (no rotation applied), so the hint tells players
-        // how to rotate the video for correct display — same as iOS AVAssetWriterInput.transform.
-        //
-        // Standard Android formula:
-        //   Back camera:  hint = (sensorOrientation - deviceOrientation + 360) % 360
-        //   Front camera: hint = (sensorOrientation + deviceOrientation) % 360
-        int deviceOr = deviceOrientationDegrees;
-        int orientationHint;
-        if (isFrontCamera) {
-            orientationHint = (sensorOrientation + deviceOr) % 360;
-        } else {
-            orientationHint = (sensorOrientation - deviceOr + 360) % 360;
-        }
+        // Use the frame rotation that WebRTC already computes correctly for the
+        // active camera + device orientation. This is the most reliable source since
+        // WebRTC handles all the sensor/device/front-back math internally.
+        // We encode raw landscape pixels, so this hint tells players how to rotate.
+        int orientationHint = lastFrameRotation;
         mediaMuxer.setOrientationHint(orientationHint);
         Log.d(TAG, "Muxer orientation hint: " + orientationHint
-                + "° (sensor=" + sensorOrientation + ", device=" + deviceOr
-                + ", front=" + isFrontCamera + ")");
+                + "° (from frame rotation, front=" + isFrontCamera + ")");
 
         // Setup video encoder (H.264 with Surface input)
         MediaFormat videoFormat = MediaFormat.createVideoFormat(
