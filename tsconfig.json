@@ -9,6 +9,8 @@
       "jsx": "react-native",
       "resolveJsonModule": true,
       "noImplicitAny": false,
+      "skipLibCheck": true,
+      "types": [],
     },
     "exclude": ["node_modules"]
 }
