@@ -51,6 +51,13 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 @property (nonatomic, strong) NSURL *recordingURL;
 @property (nonatomic, assign) BOOL hasWrittenFirstVideoFrame;
 @property (nonatomic, assign) CMTime recordingStartTime;
+
+// Delivered-fps monitor: counts frames appended per rolling wall-clock window to
+// detect thermal/encode throttle (the take dropping to ~20fps). Posts
+// HeyJoeLowFpsDetected once per take when it sustains below the floor.
+@property (nonatomic, assign) NSInteger fpsWindowFrames;
+@property (nonatomic, assign) CFTimeInterval fpsWindowStart;
+@property (nonatomic, assign) BOOL lowFpsNotified;
 @property (nonatomic, assign) BOOL audioWriterInputAdded;
 @property (nonatomic, strong, nullable) NSError *recordingSetupError;
 @property (nonatomic, assign) int encodedFrameCount;
@@ -1414,7 +1421,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 targetWidth = MIN(croppedWidth, 2160);
                 targetHeight = MIN(croppedHeight, 3840);
             }
-            bitrate = 25000000; // 25 Mbps for 4K (H.264)
+            bitrate = 18000000; // 18 Mbps for 4K (H.264) — was 25; ~28% smaller files for upload/storage (2026-07-23)
         }
 
         NSLog(@"[HeyJoeCapturer] Setting up asset writer: %dx%d @ %d Mbps H.264 (source: %dx%d, target: %s)",
@@ -1496,6 +1503,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                     self.hasWrittenFirstVideoFrame = YES;
                     NSLog(@"[HeyJoeCapturer] First video frame appended OK — writerStatus=%ld PTS=%.3f",
                           (long)self.assetWriter.status, CMTimeGetSeconds(timestamp));
+                    self.fpsWindowFrames = 0;
+                    self.fpsWindowStart = CACurrentMediaTime();
+                    self.lowFpsNotified = NO;
+                }
+
+                // Rolling delivered-fps check over ~2s of wall clock. Floor at 27
+                // (30 minus jitter headroom); a throttled ~20fps take trips it. Fire
+                // at most once per take.
+                self.fpsWindowFrames++;
+                CFTimeInterval elapsed = CACurrentMediaTime() - self.fpsWindowStart;
+                if (elapsed >= 2.0) {
+                    double fps = self.fpsWindowFrames / elapsed;
+                    if (fps < 27.0 && !self.lowFpsNotified) {
+                        self.lowFpsNotified = YES;
+                        NSLog(@"[HeyJoeCapturer] Low delivered fps: %.1f (thermal/encode throttle)", fps);
+                        [[NSNotificationCenter defaultCenter] postNotificationName:@"HeyJoeLowFpsDetected"
+                                                                            object:nil
+                                                                          userInfo:@{ @"fps": @(fps) }];
+                    }
+                    self.fpsWindowFrames = 0;
+                    self.fpsWindowStart = CACurrentMediaTime();
                 }
             } else {
                 NSError *appendErr = self.assetWriter.error;

@@ -54,7 +54,7 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     private static final int VIDEO_FPS = 30;
     private static final int IFRAME_INTERVAL = 1;
     private static final int BITRATE_1080P = 10_000_000;  // 10 Mbps
-    private static final int BITRATE_4K = 25_000_000;     // 25 Mbps
+    private static final int BITRATE_4K = 18_000_000;     // 18 Mbps (was 25) — ~28% smaller files (2026-07-31)
 
     // Audio encoding parameters
     private static final int AUDIO_SAMPLE_RATE = 48000;
@@ -81,6 +81,17 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
     private volatile int captureWidth;
     private volatile int captureHeight;
     private int captureFps;
+
+    // Low-fps monitor (thermal/encode throttle detection) — Android mirror of the
+    // iOS capturer's delivered-fps check. Counts frames actually forwarded to the
+    // recording pipeline over a rolling ~2s window; fires once per take below the
+    // 27fps floor so JS can stop/warn.
+    public interface LowFpsListener { void onLowFps(double fps); }
+    private volatile LowFpsListener lowFpsListener;
+    public void setLowFpsListener(LowFpsListener l) { this.lowFpsListener = l; }
+    private int fpsWindowFrames;
+    private long fpsWindowStartNs;
+    private boolean lowFpsNotified;
 
     // WebRTC-requested resolution (we capture higher, scale down for WebRTC)
     private volatile int webrtcWidth;
@@ -310,6 +321,24 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
                     if (handler != null) {
                         processFrameForRecording(frame, handler);
                     }
+
+                    // Rolling delivered-fps check (~2s window, floor 27). A throttled
+                    // take drops to ~20fps and trips this once.
+                    fpsWindowFrames++;
+                    long nowNs = System.nanoTime();
+                    long elapsedNs = nowNs - fpsWindowStartNs;
+                    if (elapsedNs >= 2_000_000_000L) {
+                        double fps = fpsWindowFrames / (elapsedNs / 1_000_000_000.0);
+                        if (fps < 27.0 && !lowFpsNotified) {
+                            lowFpsNotified = true;
+                            LowFpsListener l = lowFpsListener;
+                            if (l != null) {
+                                l.onLowFps(fps);
+                            }
+                        }
+                        fpsWindowFrames = 0;
+                        fpsWindowStartNs = nowNs;
+                    }
                 }
             }
         };
@@ -473,6 +502,9 @@ public class HeyJoeVideoCapturer implements VideoCapturer {
                 synchronized (stateLock) {
                     recordingState = RecordingState.RECORDING;
                 }
+                fpsWindowFrames = 0;
+                fpsWindowStartNs = System.nanoTime();
+                lowFpsNotified = false;
                 Log.d(TAG, "Recording started successfully");
                 if (callback != null) {
                     callback.onStarted(encoderWidth, encoderHeight, null);
