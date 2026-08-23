@@ -448,6 +448,11 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 /// Removing/re-adding inputs creates a fresh AVCaptureConnection, so this must be
 /// re-applied after every input swap, not just at session setup.
 - (void)_applyVideoConnectionSettingsForDevice:(AVCaptureDevice *)device {
+    // `device` is retained in the signature (callers pass the active device and future
+    // per-device connection tweaks belong here) but is unused since capture-level mirroring
+    // was removed.
+    (void)device;
+
     AVCaptureConnection *videoConnection = [self.videoDataOutput connectionWithMediaType:AVMediaTypeVideo];
     if (!videoConnection) {
         return;
@@ -456,9 +461,20 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
     if ([videoConnection isVideoOrientationSupported]) {
         videoConnection.videoOrientation = AVCaptureVideoOrientationPortrait;
     }
-    if (device.position == AVCaptureDevicePositionFront && [videoConnection isVideoMirroringSupported]) {
-        videoConnection.videoMirrored = YES;
-    }
+    // DO NOT mirror the capture connection.
+    //
+    // This output feeds BOTH the AVAssetWriter (the local recording) and
+    // didOutputSampleBuffer -> RTCVideoFrame (the live WebRTC stream), so setting
+    // videoMirrored here bakes the flip into the actual pixels: every front-camera take was
+    // written mirrored AND every remote participant saw the talent mirrored. Invisible on
+    // faces, but it reverses any text, slate, logo or signage in frame. Reported 2026-08-22;
+    // rear-camera takes were unaffected, which matches the front-camera guard that used to
+    // be here.
+    //
+    // Selfie-style preview mirroring is a RENDER concern and is already handled correctly in
+    // the view layer: Video.tsx passes `mirror` to RTCView (RTCVideoViewManager.m), which
+    // flips at draw time without touching the frame data. Local preview therefore looks
+    // exactly the same after this change.
 
     // Smooth out handheld shake with the low-latency stabilizer only. The
     // cinematic modes buffer frames inside the capture pipeline and add
