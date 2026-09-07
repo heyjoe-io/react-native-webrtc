@@ -10,11 +10,22 @@ static HeyJoeVideoCapturer *_sharedInstance = nil;
 static void *kCaptureQueueSpecificKey = &kCaptureQueueSpecificKey;
 static void *kRecordingQueueSpecificKey = &kRecordingQueueSpecificKey;
 
+/// Exact 16:9 only. Any tolerance lets 4:3 through, which is the whole problem.
+static BOOL HJIsSixteenNine(int32_t width, int32_t height) {
+    int32_t longSide = MAX(width, height);
+    int32_t shortSide = MIN(width, height);
+    if (shortSide <= 0) return NO;
+    return (longSide * 9) == (shortSide * 16);
+}
+
 /// Largest centered 16:9 (9:16 for portrait frames) crop of a width×height frame.
 /// Everything we emit — WebRTC frames and recording files — must be 16:9: the
-/// capturer picks the highest-resolution capture format, which on the front camera
-/// and on older phones' back cameras is a 4:3 sensor format, and scaling that 4:3
-/// straight into 16:9 output stretched the image for everyone in the meeting.
+/// capturer USED TO pick the highest-resolution capture format outright, which on the
+/// front camera and on older phones' back cameras is a 4:3 sensor format, and scaling
+/// that 4:3 straight into 16:9 output stretched the image for everyone in the meeting.
+/// bestFormatForDevice now PREFERS a native 16:9 format, so on any device that has one
+/// this crop is a no-op (its own math leaves an already-16:9 frame untouched). It stays
+/// as the fallback for devices that expose no 16:9 format at the target frame rate.
 /// All fields are rounded down to even values for 4:2:0 chroma alignment.
 static CGRect HJCenteredSixteenNineCrop(int width, int height) {
     BOOL landscape = width > height;
@@ -92,6 +103,11 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 // Cached device orientation — updated via notification instead of per-frame dispatch_sync.
 // Atomic because it's written on main queue but read on recordingQueue.
 @property (atomic, assign) UIDeviceOrientation cachedDeviceOrientation;
+
+// Cached camera position. Rotation metadata is produced on videoOutputQueue while
+// videoInput is owned by captureQueue, so the position must not be read cross-queue.
+// Kept in sync by the videoInput setter below, so every assignment site updates it.
+@property (atomic, assign) AVCaptureDevicePosition cachedCameraPosition;
 
 @end
 
@@ -209,8 +225,26 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 
 #pragma mark - Orientation Handling
 
+/// Overridden so the atomically-readable camera position tracks EVERY assignment of
+/// videoInput (initial setup, camera flip, teardown) without three call sites to keep
+/// in step.
+- (void)setVideoInput:(AVCaptureDeviceInput *)videoInput {
+    _videoInput = videoInput;
+    self.cachedCameraPosition = videoInput ? videoInput.device.position
+                                           : AVCaptureDevicePositionUnspecified;
+}
+
 - (void)deviceOrientationDidChange:(NSNotification *)notification {
-    self.cachedDeviceOrientation = [UIDevice currentDevice].orientation;
+    UIDeviceOrientation o = [UIDevice currentDevice].orientation;
+
+    // Ignore FaceUp / FaceDown / Unknown and KEEP THE LAST REAL ORIENTATION. These fire
+    // whenever the phone is laid flat or tilted, and treating them as portrait (the old
+    // `default:` fallthrough below) silently re-framed video that was shot in landscape.
+    // Apple's own RTCCameraVideoCapturer ignores them for the same reason.
+    if (!UIDeviceOrientationIsPortrait(o) && !UIDeviceOrientationIsLandscape(o)) {
+        return;
+    }
+    self.cachedDeviceOrientation = o;
 }
 
 - (void)handleMemoryWarning:(NSNotification *)notification {
@@ -233,16 +267,24 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 
 - (RTCVideoRotation)rtcVideoRotationForCurrentDeviceOrientation {
     UIDeviceOrientation deviceOrientation = [self currentDeviceOrientation];
+    BOOL front = (self.cachedCameraPosition == AVCaptureDevicePositionFront);
 
     switch (deviceOrientation) {
         case UIDeviceOrientationPortrait:
             return RTCVideoRotation_0;
         case UIDeviceOrientationPortraitUpsideDown:
             return RTCVideoRotation_180;
+        // FRONT CAMERA IS 180 OUT IN LANDSCAPE WITHOUT THIS TERM. A horizontal mirror
+        // conjugates rotation to its negative (mirror.rotate(t) == rotate(-t).mirror), so
+        // 90 <-> 270 while 0 and 180 are unaffected. These constants were correct only
+        // while the front camera was mirrored AT CAPTURE; that mirroring was removed on
+        // 2026-08-23 (it was baking flips into recordings), which left the two landscape
+        // cases inverted for the front camera only. Apple's RTCCameraVideoCapturer carries
+        // the equivalent front/back term.
         case UIDeviceOrientationLandscapeLeft:
-            return RTCVideoRotation_270;
+            return front ? RTCVideoRotation_90 : RTCVideoRotation_270;
         case UIDeviceOrientationLandscapeRight:
-            return RTCVideoRotation_90;
+            return front ? RTCVideoRotation_270 : RTCVideoRotation_90;
         default:
             return RTCVideoRotation_0;
     }
@@ -250,16 +292,19 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 
 - (CGAffineTransform)videoTransformForCurrentDeviceOrientation {
     UIDeviceOrientation deviceOrientation = [self currentDeviceOrientation];
+    BOOL front = (self.cachedCameraPosition == AVCaptureDevicePositionFront);
 
     switch (deviceOrientation) {
         case UIDeviceOrientationPortrait:
             return CGAffineTransformIdentity;
         case UIDeviceOrientationPortraitUpsideDown:
             return CGAffineTransformMakeRotation(M_PI);
+        // Same front/back term as the WebRTC path above — without it, landscape
+        // self-tapes on the front camera were written upside down.
         case UIDeviceOrientationLandscapeLeft:
-            return CGAffineTransformMakeRotation(-M_PI_2);
+            return CGAffineTransformMakeRotation(front ? M_PI_2 : -M_PI_2);
         case UIDeviceOrientationLandscapeRight:
-            return CGAffineTransformMakeRotation(M_PI_2);
+            return CGAffineTransformMakeRotation(front ? -M_PI_2 : M_PI_2);
         default:
             return CGAffineTransformIdentity;
     }
@@ -1580,6 +1625,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
     AVCaptureDeviceFormat *bestFormat = nil;
     int32_t bestPixelCount = 0;
+    BOOL bestIs169 = NO;
 
     const int32_t maxPixelCount = 3840 * 2160;
 
@@ -1605,9 +1651,27 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         BOOL isBiplanar = (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                           pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
 
+        BOOL thisIs169 = HJIsSixteenNine(dims.width, dims.height);
+
+        // A NATIVE 16:9 FORMAT BEATS ANY 4:3 FORMAT AT ANY RESOLUTION. Selecting purely on
+        // pixel count landed on a 4:3 sensor format, and HJCenteredSixteenNineCrop then threw
+        // away 25% of the picture to reach 16:9 — the "the meeting punches in on the subject"
+        // reports. Capturing 16:9 natively makes that crop a no-op (its own math leaves an
+        // already-16:9 frame untouched), so nothing at the three crop call sites changes.
+        // Modern iPhones expose 3840x2160, so this does not cost resolution.
+        if (bestFormat && thisIs169 != bestIs169) {
+            if (thisIs169) {
+                bestFormat = format;
+                bestPixelCount = pixelCount;
+                bestIs169 = YES;
+            }
+            continue;
+        }
+
         if (pixelCount > bestPixelCount) {
             bestFormat = format;
             bestPixelCount = pixelCount;
+            bestIs169 = thisIs169;
         } else if (pixelCount == bestPixelCount && bestFormat) {
             // Same resolution: break ties by (1) stabilization support, then (2) biplanar
             // pixel format. Stabilization wins because the highest-res format isn't always
