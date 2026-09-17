@@ -109,6 +109,12 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 // Kept in sync by the videoInput setter below, so every assignment site updates it.
 @property (atomic, assign) AVCaptureDevicePosition cachedCameraPosition;
 
+// Audio-integrity guard. A take with degraded or absent audio is worthless and
+// cannot be recovered after the fact, so we refuse to keep recording one.
+@property (nonatomic, assign) BOOL audioGuardChecked;
+@property (nonatomic, assign) NSTimeInterval firstVideoFrameWallClock;
+@property (nonatomic, assign) BOOL audioAbsenceReported;
+
 @end
 
 @implementation HeyJoeVideoCapturer
@@ -877,6 +883,44 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 }
 
 /// Must be called on recordingQueue. Handles audio sample from audioOutputQueue.
+/// Returns a human-readable reason the CURRENT audio capture path is unfit to
+/// record, or nil if it looks fine.
+///
+/// WHY THIS EXISTS (2026-09-17): a session produced takes whose audio track was
+/// band-limited to ~2.5 kHz — present, but unusable, and undetectable until the
+/// footage was reviewed. Nothing in this file had ever inspected the audio path;
+/// it wrote whatever arrived.
+///
+/// ⚠️ A SAMPLE-RATE CHECK ALONE IS NOT ENOUGH. When AVAudioSession is in a
+/// voice-chat mode, iOS applies voice processing that band-limits the signal
+/// while still REPORTING 44.1/48 kHz. That is why the bad takes looked normal by
+/// every number we had. The mode is the thing that actually predicts the damage.
+- (NSString *)_audioPathProblemReason {
+    AVAudioSession *sess = [AVAudioSession sharedInstance];
+    NSString *mode = sess.mode;
+    double hwRate = sess.sampleRate;
+
+    if ([mode isEqualToString:AVAudioSessionModeVoiceChat] ||
+        [mode isEqualToString:AVAudioSessionModeVideoChat]) {
+        return [NSString stringWithFormat:@"audio session is in %@ — voice processing band-limits the recording", mode];
+    }
+    if (hwRate > 0 && hwRate < 32000.0) {
+        return [NSString stringWithFormat:@"audio hardware rate is %.0f Hz (expected >= 32000)", hwRate];
+    }
+    return nil;
+}
+
+/// Stop the take and tell JS why. Called for both degraded and absent audio.
+- (void)_failRecordingForAudio:(NSString *)reason {
+    NSLog(@"[HeyJoeCapturer] AUDIO GUARD TRIPPED — %@", reason);
+    self.lastRecordingFailurePoint = @"audioGuard";
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"HeyJoeBadAudioDetected"
+                                                        object:nil
+                                                      userInfo:@{ @"reason": reason ?: @"unknown" }];
+    [self _failRecordingWithError:[NSError errorWithDomain:@"HeyJoeCapturer" code:30
+        userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Recording stopped — %@", reason] }]];
+}
+
 - (void)_handleAudioSample:(CMSampleBufferRef)sampleBuffer {
     if (self.recordingState != HJRecordingStateRecording) {
         CFRelease(sampleBuffer);
@@ -913,11 +957,28 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
             CMFormatDescriptionRef outFmt = CMSampleBufferGetFormatDescription(bufferToAppend);
             const AudioStreamBasicDescription *inASBD = inFmt ? CMAudioFormatDescriptionGetStreamBasicDescription(inFmt) : NULL;
             const AudioStreamBasicDescription *outASBD = outFmt ? CMAudioFormatDescriptionGetStreamBasicDescription(outFmt) : NULL;
-            NSLog(@"[HeyJoeCapturer] First audio frame: %.0fHz %uch → %uch %s",
+            AVAudioSession *sess = [AVAudioSession sharedInstance];
+            NSLog(@"[HeyJoeCapturer] First audio frame: %.0fHz %uch → %uch %s | session: cat=%@ mode=%@ hwRate=%.0f",
                   inASBD ? inASBD->mSampleRate : 0,
                   inASBD ? (unsigned)inASBD->mChannelsPerFrame : 0,
                   outASBD ? (unsigned)outASBD->mChannelsPerFrame : 0,
-                  stereoBuffer ? "(downmixed)" : "(passthrough)");
+                  stereoBuffer ? "(downmixed)" : "(passthrough)",
+                  sess.category, sess.mode, sess.sampleRate);
+
+            // Refuse to record a take we already know will be unusable.
+            if (!self.audioGuardChecked) {
+                self.audioGuardChecked = YES;
+                NSString *problem = [self _audioPathProblemReason];
+                if (!problem && inASBD && inASBD->mSampleRate > 0 && inASBD->mSampleRate < 32000.0) {
+                    problem = [NSString stringWithFormat:@"capture sample rate is %.0f Hz", inASBD->mSampleRate];
+                }
+                if (problem) {
+                    if (stereoBuffer) CFRelease(stereoBuffer);
+                    CFRelease(sampleBuffer);
+                    [self _failRecordingForAudio:problem];
+                    return;
+                }
+            }
         }
         self.audioFrameCount++;
         if (![self.audioWriterInput appendSampleBuffer:bufferToAppend]) {
@@ -1567,6 +1628,22 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                     self.fpsWindowFrames = 0;
                     self.fpsWindowStart = CACurrentMediaTime();
                     self.lowFpsNotified = NO;
+                    self.firstVideoFrameWallClock = CACurrentMediaTime();
+                    self.audioGuardChecked = NO;
+                    self.audioAbsenceReported = NO;
+                }
+
+                // NO AUDIO AT ALL. The first-frame guard above only runs when a
+                // sample actually arrives, so a dead mic would sail straight past
+                // it and produce a silent take. Give the mic a few seconds to
+                // deliver, then stop rather than record silence.
+                if (!self.audioAbsenceReported && self.audioFrameCount == 0 &&
+                    self.firstVideoFrameWallClock > 0 &&
+                    (CACurrentMediaTime() - self.firstVideoFrameWallClock) > 4.0) {
+                    self.audioAbsenceReported = YES;
+                    if (scaledBuffer) CVPixelBufferRelease(scaledBuffer);
+                    [self _failRecordingForAudio:@"no audio reached the recorder in the first 4 seconds"];
+                    return;
                 }
 
                 // Rolling delivered-fps check over ~2s of wall clock. Floor at 27
