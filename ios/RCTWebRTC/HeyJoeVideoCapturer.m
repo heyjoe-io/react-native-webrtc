@@ -998,15 +998,20 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 /// every number we had. The mode is the thing that actually predicts the damage.
 - (NSString *)_audioPathProblemReason {
     AVAudioSession *sess = [AVAudioSession sharedInstance];
-    NSString *mode = sess.mode;
     double hwRate = sess.sampleRate;
 
-    if ([mode isEqualToString:AVAudioSessionModeVoiceChat] ||
-        [mode isEqualToString:AVAudioSessionModeVideoChat]) {
-        return [NSString stringWithFormat:@"audio session is in %@ — voice processing band-limits the recording", mode];
-    }
+    // ⛔ DO NOT CHECK FOR VoiceChat / VideoChat MODE HERE. It was tried on
+    // 2026-09-17 and it is WRONG: WebRTC puts the session in VoiceChat mode for
+    // EVERY call, so the check fired on a perfectly healthy take and would have
+    // stopped every recording made during a meeting. It also disproves the theory
+    // behind it — if voice-chat mode caused the band-limited audio, two years of
+    // recordings would have been broken.
+    //
+    // The real failure is the capture AUDIO INPUT dying (typically after a phone
+    // call), which shows up as audio buffers ARRIVING FAR BELOW THE EXPECTED RATE
+    // — see the delivery-rate check in the video path. Not as a session mode.
     if (hwRate > 0 && hwRate < 32000.0) {
-        return [NSString stringWithFormat:@"audio hardware rate is %.0f Hz (expected >= 32000)", hwRate];
+        return [NSString stringWithFormat:@"microphone rate dropped to %.0f Hz", hwRate];
     }
     return nil;
 }
@@ -1738,13 +1743,31 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
                 // sample actually arrives, so a dead mic would sail straight past
                 // it and produce a silent take. Give the mic a few seconds to
                 // deliver, then stop rather than record silence.
-                if (!self.audioAbsenceReported && self.audioFrameCount == 0 &&
-                    self.firstVideoFrameWallClock > 0 &&
+                if (!self.audioAbsenceReported && self.firstVideoFrameWallClock > 0 &&
                     (CACurrentMediaTime() - self.firstVideoFrameWallClock) > 4.0) {
+
+                    // THE REAL FAILURE MODE. On 2026-09-17 a phone call killed the
+                    // capture session's audio input; a few buffers still trickled
+                    // through, so the takes were not silent-with-no-track — they had
+                    // a nearly EMPTY track (which is why a tool reported "2.5 kHz":
+                    // samples/duration, not band-limiting). A zero-check alone misses
+                    // this. At 48 kHz the input delivers roughly 45 buffers/sec, so
+                    // anything under ~5/sec over the first 4 seconds is a dying input,
+                    // with a wide margin so normal jitter never trips it.
+                    double secs = CACurrentMediaTime() - self.firstVideoFrameWallClock;
+                    double perSec = secs > 0 ? (self.audioFrameCount / secs) : 0;
+
+                    if (self.audioFrameCount == 0 || perSec < 5.0) {
+                        self.audioAbsenceReported = YES;
+                        if (scaledBuffer) CVPixelBufferRelease(scaledBuffer);
+                        NSString *why = self.audioFrameCount == 0
+                            ? @"no sound is reaching the recorder"
+                            : [NSString stringWithFormat:@"sound is barely reaching the recorder (%.1f/sec, expected ~45)", perSec];
+                        [self _failRecordingForAudio:why];
+                        return;
+                    }
+                    // Healthy — do not check again for this take.
                     self.audioAbsenceReported = YES;
-                    if (scaledBuffer) CVPixelBufferRelease(scaledBuffer);
-                    [self _failRecordingForAudio:@"no audio reached the recorder in the first 4 seconds"];
-                    return;
                 }
 
                 // Rolling delivered-fps check over ~2s of wall clock. Floor at 27
