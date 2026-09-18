@@ -157,6 +157,14 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
 
         // Cache device orientation — avoids dispatch_sync to main queue at 30fps
         _cachedDeviceOrientation = UIDeviceOrientationPortrait;
+        // AUDIO SESSION INTERRUPTIONS (incoming phone call, Siri, other apps).
+        // Without these the session is left in the interrupter's configuration and
+        // every later take records through it — see _handleAudioInterruption.
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(_handleAudioInterruption:)
+                                                     name:AVAudioSessionInterruptionNotification
+                                                   object:[AVAudioSession sharedInstance]];
+
         [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(deviceOrientationDidChange:)
@@ -227,6 +235,99 @@ static CGRect HJCenteredSixteenNineCrop(int width, int height) {
         _sharedInstance = nil;
     }
     NSLog(@"[HeyJoeCapturer] Deallocated");
+}
+
+#pragma mark - Audio Session Interruptions
+
+/// An incoming phone call (or Siri, or another app) takes the audio hardware and
+/// reconfigures AVAudioSession for ITS purpose. iOS posts this notification; until
+/// 2026-09-17 nothing in this app listened, with two consequences:
+///
+///   1. The take in progress kept recording through a seized/!reconfigured mic.
+///   2. When the interruption ended the session was never restored, so EVERY
+///      SUBSEQUENT TAKE recorded band-limited (~2.5 kHz) audio while still
+///      reporting 48 kHz. Joe lost most of a session to this.
+///
+/// ⚠️ RESTARTING THE RECORDING DOES NOT FIX IT, which is the non-obvious part and
+/// the reason this has to rebuild the capture input rather than just re-activate
+/// the session: the AVCaptureSession's audio input is created ONCE during setup and
+/// never re-added, so a take started after the call still feeds from the input that
+/// was captured in the degraded state. Removing and re-adding it forces
+/// AVFoundation to renegotiate the format against the restored session.
+- (void)_handleAudioInterruption:(NSNotification *)notification {
+    NSUInteger type = [notification.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        NSLog(@"[HeyJoeCapturer] Audio session INTERRUPTED (phone call / Siri / other app)");
+        if (self.recordingActive) {
+            // A take that continues through an interruption has a hole in its audio
+            // at best and is silent from here at worst. Stop it while it is still
+            // obvious why, rather than discovering it in review.
+            dispatch_async(self.recordingQueue, ^{
+                if (self.recordingState == HJRecordingStateRecording) {
+                    [self _failRecordingForAudio:@"an incoming call interrupted the audio"];
+                }
+            });
+        }
+        return;
+    }
+
+    if (type == AVAudioSessionInterruptionTypeEnded) {
+        NSUInteger opts = [notification.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+        NSLog(@"[HeyJoeCapturer] Audio session interruption ENDED (shouldResume=%d)",
+              (opts & AVAudioSessionInterruptionOptionShouldResume) ? 1 : 0);
+        [self _rebuildAudioInput];
+        return;
+    }
+}
+
+/// Remove and re-add the capture session's audio input so its format is renegotiated
+/// against the current (post-interruption) audio session. Runs on captureQueue,
+/// which owns the session.
+- (void)_rebuildAudioInput {
+    dispatch_async(self.captureQueue, ^{
+        if (!self.captureSession) {
+            return;
+        }
+
+        AVAudioSession *sess = [AVAudioSession sharedInstance];
+        NSError *actErr = nil;
+        [sess setActive:YES error:&actErr];
+        if (actErr) {
+            NSLog(@"[HeyJoeCapturer] Could not reactivate audio session: %@", actErr.localizedDescription);
+        }
+
+        AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        if (!audioDevice) {
+            NSLog(@"[HeyJoeCapturer] No audio device while rebuilding input");
+            return;
+        }
+
+        NSError *inErr = nil;
+        AVCaptureDeviceInput *fresh = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:&inErr];
+        if (!fresh || inErr) {
+            NSLog(@"[HeyJoeCapturer] Could not create fresh audio input: %@", inErr.localizedDescription);
+            return;
+        }
+
+        [self.captureSession beginConfiguration];
+        if (self.audioInput) {
+            [self.captureSession removeInput:self.audioInput];
+        }
+        if ([self.captureSession canAddInput:fresh]) {
+            [self.captureSession addInput:fresh];
+            self.audioInput = fresh;
+            NSLog(@"[HeyJoeCapturer] Audio input rebuilt after interruption | session: cat=%@ mode=%@ hwRate=%.0f",
+                  sess.category, sess.mode, sess.sampleRate);
+        } else {
+            // Put the old one back rather than leaving the session with no audio.
+            if (self.audioInput && [self.captureSession canAddInput:self.audioInput]) {
+                [self.captureSession addInput:self.audioInput];
+            }
+            NSLog(@"[HeyJoeCapturer] Could not add fresh audio input — restored previous");
+        }
+        [self.captureSession commitConfiguration];
+    });
 }
 
 #pragma mark - Orientation Handling
